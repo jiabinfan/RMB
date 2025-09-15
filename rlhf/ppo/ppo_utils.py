@@ -147,6 +147,7 @@ def transfer_template_rm(prompt, response, tokenizer, rm_tokenizer):
 
 
 def build_dataset_unified(data_path, tokenizer, script_args, split='', size=None):
+
     ds = datasets.load_dataset(data_path, split=split)
 
     if size is not None:

@@ -1,9 +1,9 @@
-devices=0,1,2,3
-n_gpu=4
+devices=3
+n_gpu=1
 dataset_name='rlhf/data/unified_sampled_gold_score'
 base_model='google/gemma-2b-it'
 wandb_name="GRM"
-log_dir='rlhf/bon/save_reward_models'
+log_dir='rlhf/bon/save_reward_models/noise'
 main_process_port=9994
 
 lora_r=32

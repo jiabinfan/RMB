@@ -1,6 +1,6 @@
-devices=0,1,2,3
-n_gpu=4
-main_process_port=9997
+devices=5
+n_gpu=1
+main_process_port=9987
 
 
 cd ../..

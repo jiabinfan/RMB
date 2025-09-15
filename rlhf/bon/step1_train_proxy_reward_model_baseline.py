@@ -30,7 +30,7 @@ class ScriptArguments:
     gradient_accumulation_steps: Optional[int] = field(default=16)
     learning_rate: Optional[float] = field(default=1e-5)
     num_train_epochs: Optional[int] = field(default=2, metadata={"help": "The number of training epochs for the reward model."})
-    optim: Optional[str] = field(default="adamw_hf",  metadata={"help": "The optimizer to use."})
+    optim: Optional[str] = field(default="adamw_torch",  metadata={"help": "The optimizer to use."}) # adamw_hf
     lr_scheduler_type: Optional[str] = field(default="cosine", metadata={"help": "The lr scheduler"},)
     max_length: Optional[int] = field(default=1024) 
     gradient_checkpointing: Optional[bool] = field(default=True)
@@ -75,12 +75,12 @@ else:
 device = Accelerator().local_process_index 
 
 training_args = TrainingArguments(
-    output_dir=os.path.join(output_name, 'logs'),
+    output_dir=os.path.join(output_name, 'logs1'),
     learning_rate=script_args.learning_rate,
     per_device_train_batch_size=script_args.per_device_train_batch_size,
     per_device_eval_batch_size=script_args.per_device_eval_batch_size,
     num_train_epochs=script_args.num_train_epochs,
-    evaluation_strategy=script_args.evaluation_strategy,
+    eval_strategy=script_args.evaluation_strategy,
     eval_steps=script_args.eval_steps,
     save_strategy=script_args.save_strategy,
     save_steps=script_args.save_steps,

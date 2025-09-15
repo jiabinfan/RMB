@@ -2,10 +2,57 @@ import torch
 import torch.nn as nn
 import os
 from collections import OrderedDict
-from transformers import AutoModelForCausalLM, AutoModelForSeq2SeqLM
+from transformers import AutoModelForCausalLM
 from trl import PreTrainedModelWrapper
 from peft import PeftModel, PeftConfig
 from safetensors import safe_open
+
+
+def unwrap_model(model: nn.Module) -> nn.Module:
+    """
+    Recursively unwraps a model from potential containers (as used in distributed training).
+
+    Args:
+        model (`torch.nn.Module`): The model to unwrap.
+    """
+    # since there could be multiple levels of wrapping, unwrap recursively
+    if hasattr(model, "module"):
+        return unwrap_model(model.module)
+    else:
+        return model
+
+
+def is_lora_model(model):
+    for key in model.state_dict().keys():
+        if 'lora' in key:
+            return True
+    return False
+
+def get_trainable_weights(model):
+    save_dict = OrderedDict()
+    state_dict = model.state_dict()
+    for key, value in model.named_parameters():
+        if value.requires_grad:
+            if 'pretrained_model.' in key:
+                key = key.replace('pretrained_model.', '')
+            save_dict[key] = state_dict[key]
+    return save_dict
+
+def print_trainable_parameters(model):
+    """
+    Prints the number of trainable parameters in the model.
+    """
+    trainable_params = 0
+    all_param = 0
+    for name, param in model.named_parameters():
+        all_param += param.numel()
+        if param.requires_grad:
+            print(name)
+            trainable_params += param.numel()
+    print(
+        f"trainable params: {trainable_params} || all params: {all_param} || trainable%: {100 * trainable_params / all_param}"
+    )
+
 
 
 class ValueHead(nn.Module):
@@ -19,8 +66,10 @@ class ValueHead(nn.Module):
             summary_dropout_prob = kwargs.pop("summary_dropout_prob", 0.1)
         else:
             summary_dropout_prob = config.summary_dropout_prob
+
         self.dropout = nn.Dropout(summary_dropout_prob) if summary_dropout_prob else nn.Identity()
 
+        # some models such as OPT have a projection layer before the word embeddings - e.g. OPT-350m
         if hasattr(config, "hidden_size"):
             hidden_size = config.hidden_size
         if hasattr(config, "word_embed_proj_dim"):
@@ -30,27 +79,11 @@ class ValueHead(nn.Module):
                 if hasattr(config.decoder, "hidden_size"):
                     hidden_size = config.decoder.hidden_size
 
-        # get vhead config
-        if hasattr(config, "vhead_layer_type"): # try config from json first
-            self.layer_type = config.vhead_layer_type
-        else:
-            self.layer_type = kwargs.pop("vhead_layer_type", 'mlp')
-        if hasattr(config, 'vhead_num_neurons'):
-            num_neurons = config.vhead_num_neurons
-        else:
-            num_neurons = kwargs.pop("vhead_num_neurons", 1024)
-        if hasattr(config, 'vhead_num_layers'):
-            num_layers = config.vhead_num_layers
-        else:
-            num_layers = kwargs.pop("vhead_num_layers", 1)
-
-        if hasattr(config, 'vhead_num_output'):
-            num_output = config.vhead_num_output
-        else:
-            num_output = kwargs.pop("vhead_num_output", 1)
-
+        self.layer_type = kwargs.pop("layer_type", 'linear')
+        num_neurons = kwargs.pop("num_neurons", 1024)
+        num_layers = kwargs.pop("num_layers", 1)
         if self.layer_type == 'linear':
-            self.summary = nn.Linear(hidden_size, num_output)
+            self.summary = nn.Linear(hidden_size, 1)
         else:
             module_lis = []
             input_neurons = hidden_size
@@ -58,7 +91,7 @@ class ValueHead(nn.Module):
                 module_lis.extend([nn.Linear(input_neurons, num_neurons), nn.ReLU()])
                 input_neurons = num_neurons
                 
-            module_lis.append(nn.Linear(num_neurons, num_output))
+            module_lis.append(nn.Linear(num_neurons, 1))
             self.summary = nn.Sequential(*module_lis)
         self.flatten = nn.Flatten()
 
@@ -74,21 +107,53 @@ class ValueHead(nn.Module):
 
 
 class AutoModelForCausalLMWithValueHead(PreTrainedModelWrapper):
+    r"""
+    An autoregressive model with a value head in addition to the language model head.
+    This class inherits from `~trl.PreTrainedModelWrapper` and wraps a
+    `transformers.PreTrainedModel` class. The wrapper class supports classic functions
+    such as `from_pretrained`, `push_to_hub` and `generate`. To call a method of the wrapped
+    model, simply manipulate the `pretrained_model` attribute of this class.
+
+    Class attributes:
+        - **transformers_parent_class** (`transformers.PreTrainedModel`) -- The parent class of the wrapped model. This
+            should be set to `transformers.AutoModelForCausalLM` for this class.
+        - **lm_head_namings** (`tuple`) -- A tuple of strings that are used to identify the language model head of the
+            wrapped model. This is set to `("lm_head", "embed_out")` for this class but can be changed for other models
+            in the future
+        - **supported_args** (`tuple`) -- A tuple of strings that are used to identify the arguments that are supported
+            by the `ValueHead` class. Currently, the supported args are:
+            - **summary_dropout_prob** (`float`, `optional`, defaults to `None`) -- The dropout probability for the
+                `ValueHead` class.
+            - **v_head_initializer_range** (`float`, `optional`, defaults to `0.2`) -- The initializer range for the
+                `ValueHead` if a specific initialization strategy is selected.
+            - **v_head_init_strategy** (`str`, `optional`, defaults to `None`) -- The initialization strategy for the
+                `ValueHead`. Currently, the supported strategies are:
+                - **`None`** -- Initializes the weights of the `ValueHead` with a random distribution. This is the default
+                    strategy.
+                - **"normal"** -- Initializes the weights of the `ValueHead` with a normal distribution.
+
+    """
     transformers_parent_class = AutoModelForCausalLM
     lm_head_namings = ["lm_head", "embed_out"]
     supported_args = (
         "summary_dropout_prob",
         "v_head_initializer_range",
         "v_head_init_strategy",
-        "vhead_layer_type",
-        'vhead_num_neurons',
-        'vhead_num_layers',
-        'vhead_num_output',
+        "layer_type",
+        'num_neurons',
+        'num_layers',
     )
 
     def __init__(self, pretrained_model, **kwargs):
         r"""
         Initializes the model.
+
+        Args:
+            pretrained_model (`transformers.PreTrainedModel`):
+                The model to wrap. It should be a causal language model such as GPT2.
+                or any model mapped inside the `AutoModelForCausalLM` class.
+            kwargs (`dict`, `optional`):
+                Additional keyword arguments, that are passed to the `ValueHead` class.
         """
         super().__init__(pretrained_model, **kwargs)
         v_head_kwargs, _, _ = self._split_kwargs(kwargs)
@@ -97,9 +162,22 @@ class AutoModelForCausalLMWithValueHead(PreTrainedModelWrapper):
             raise ValueError("The model does not have a language model head, please use a model that has one.")
 
         self.v_head = ValueHead(self.pretrained_model.config, **v_head_kwargs)
+
         self._init_weights(**v_head_kwargs)
 
     def _init_weights(self, **kwargs):
+        r"""
+        Initializes the weights of the value head. The default initialization strategy is random.
+        Users can pass a different initialization strategy by passing the `v_head_init_strategy` argument
+        when calling `.from_pretrained`. Supported strategies are:
+        - `normal`: initializes the weights with a normal distribution.
+
+        Args:
+            **kwargs (`dict`, `optional`):
+                Additional keyword arguments, that are passed to the `ValueHead` class. These arguments
+                can contain the `v_head_init_strategy` argument as well as the `v_head_initializer_range`
+                argument.
+        """
         initializer_range = kwargs.pop("v_head_initializer_range", 0.2)
         # random init by default
         init_strategy = kwargs.pop("v_head_init_strategy", None)
@@ -117,6 +195,22 @@ class AutoModelForCausalLMWithValueHead(PreTrainedModelWrapper):
         attention_mask=None,
         **kwargs,
     ):
+        r"""
+        Applies a forward pass to the wrapped model and returns the logits of the value head.
+
+        Args:
+            input_ids (`torch.LongTensor` of shape `(batch_size, sequence_length)`):
+                Indices of input sequence tokens in the vocabulary.
+            past_key_values (`tuple(tuple(torch.FloatTensor))`, `optional`):
+                Contains pre-computed hidden-states (key and values in the attention blocks) as computed by the model
+                (see `past_key_values` input) to speed up sequential decoding.
+            attention_mask (`torch.FloatTensor` of shape `(batch_size, sequence_length)`, `optional`):
+                Mask to avoid performing attention on padding token indices. Mask values selected in ``[0, 1]``:
+                - 1 for tokens that are **not masked**,
+                - 0 for tokens that are **masked**.
+            kwargs (`dict`, `optional`):
+                Additional keyword arguments, that are passed to the wrapped model.
+        """
         kwargs["output_hidden_states"] = True  # this had already been set in the LORA / PEFT examples
         kwargs["past_key_values"] = past_key_values
 
@@ -148,35 +242,38 @@ class AutoModelForCausalLMWithValueHead(PreTrainedModelWrapper):
 
         return (lm_logits, loss, value)
 
+    def generate(self, *args, **kwargs):
+        r"""
+        A simple wrapper around the `generate` method of the wrapped model.
+        Please refer to the [`generate`](https://huggingface.co/docs/transformers/internal/generation_utils)
+        method of the wrapped model for more information about the supported arguments.
+
+        Args:
+            *args (`list`, *optional*):
+                Positional arguments passed to the `generate` method of the wrapped model.
+            **kwargs (`dict`, *optional*):
+                Keyword arguments passed to the `generate` method of the wrapped model.
+        """
+        return self.pretrained_model.generate(*args, **kwargs)
+
     def state_dict(self, *args, **kwargs):
         r"""
         Returns the state dictionary of the model. We add the state dictionary of the value head
         to the state dictionary of the wrapped model by prepending the key with `v_head.`.
         """
-        # pretrained_model_state_dict = self.pretrained_model.state_dict(*args, **kwargs)
+        ### return lora 
+        pretrained_model_state_dict = self.pretrained_model.state_dict(*args, **kwargs).copy()
 
-        # v_head_state_dict = self.v_head.state_dict(*args, **kwargs)
-        # for k, v in v_head_state_dict.items():
-        #     pretrained_model_state_dict[f"v_head.{k}"] = v
-        # return pretrained_model_state_dict
-        """
-        Returns the state dict with both the base model and the v_head params.
-        We snapshot v_head items into a list to avoid mutating the OrderedDict
-        during iteration.
-        """
-        # 1) Pull base model weights (as a fresh dict, not an OrderedDict)
-        base_sd: dict = dict(self.pretrained_model.state_dict(*args, **kwargs))
-        
-        # 2) Get value-head weights (an OrderedDict under the hood)
-        vhead_sd = self.v_head.state_dict(*args, **kwargs)
-        
-        # 3) Iterate over a static list of items to avoid mutation-during-iteration
-        for name, tensor in list(vhead_sd.items()):
-            base_sd[f"v_head.{name}"] = tensor
-        
-        return base_sd
+        v_head_state_dict = self.v_head.state_dict(*args, **kwargs).copy()
+        for k, v in v_head_state_dict.items():
+            pretrained_model_state_dict[f"v_head.{k}"] = v
+        # print('pretrained_model_state_dict', pretrained_model_state_dict.keys())
+        # input()
+        return pretrained_model_state_dict
+
     def push_to_hub(self, *args, **kwargs):
         setattr(self.pretrained_model, "v_head", self.v_head)
+
         return self.pretrained_model.push_to_hub(*args, **kwargs)
 
     
@@ -218,117 +315,17 @@ class AutoModelForCausalLMWithValueHead(PreTrainedModelWrapper):
             self.register_forward_hook(set_device_hook)
 
             self.is_sequential_parallel = True
-    
-    @classmethod
-    def register_for_auto_class(cls, auto_class="AutoModel"):
-        if not isinstance(auto_class, str):
-            auto_class = auto_class.__name__
 
-        import transformers.models.auto as auto_module
 
-        if not hasattr(auto_module, auto_class):
-            raise ValueError(f"{auto_class} is not a valid auto class.")
-
-        cls._auto_class = auto_class
-
-class AutoModelForCausalLMWithMultiValueHead(PreTrainedModelWrapper):
-    """
-    Same as AutoModelForCausalLMWithValueHead but hosts N independent value heads.
-    Call with kwarg `num_value_heads`; default = 1 for backward-compat.
-    """
-    transformers_parent_class = AutoModelForCausalLM
-    lm_head_namings = ["lm_head", "embed_out"]
-    supported_args = (*AutoModelForCausalLMWithValueHead.supported_args, "num_value_heads")
-
-    def __init__(self, pretrained_model, **kwargs):
-        v_head_kwargs, _, remaining = self._split_kwargs(kwargs)
-        self.num_value_heads = v_head_kwargs.pop("num_value_heads", 1)
-        super().__init__(pretrained_model, **remaining)
-
-        # One ValueHead per adapter → ModuleList for easy indexing
-        self.v_heads = nn.ModuleList(
-            [ValueHead(self.pretrained_model.config, **v_head_kwargs)
-             for _ in range(self.num_value_heads)]
-        )
-
-    # ------- helper -------
-    def _select_vhead(self, idx: int) -> nn.Module:
-        if idx >= len(self.v_heads):
-            raise IndexError(f"Requested v_head {idx}, but only "
-                             f"{len(self.v_heads)} heads registered.")
-        return self.v_heads[idx]
-
-    # -------- forward --------
-    def forward(self, input_ids=None, attention_mask=None,
-                active_head: int = 0, **kwargs):
-        kwargs["output_hidden_states"] = True
-        base_out = self.pretrained_model(
-            input_ids=input_ids, attention_mask=attention_mask, **kwargs
-        )
-        last_hidden = base_out.hidden_states[-1]
-
-        # index last non-pad token for every sample
-        last_idx = attention_mask.sum(dim=-1) - 1
-        v = self._select_vhead(active_head)(last_hidden)          # (B,L,1)
-        reward = v.squeeze(-1)[torch.arange(len(v)), last_idx]    # (B,)
-
-        return (base_out.logits, base_out.loss, reward)
-
-    # -------- state_dict helpers (save / load) --------
-    def state_dict(self, *args, **kwargs):
-        sd = dict(self.pretrained_model.state_dict(*args, **kwargs))
-        for i, v_head in enumerate(self.v_heads):
-            for k, t in v_head.state_dict().items():
-                sd[f"v_heads.{i}.{k}"] = t
-        return sd
-
-    def post_init(self, state_dict):
-        # Strip the 'v_heads.x.' prefix when loading a checkpoint
-        per_head_sd = [dict() for _ in range(self.num_value_heads)]
-        for k in list(state_dict.keys()):
-            if k.startswith("v_heads."):
-                _, idx, *rest = k.split(".")
-                idx = int(idx)
-                new_k = ".".join(rest)
-                per_head_sd[idx][new_k] = state_dict.pop(k)
-
-        # 2) load each value-head (ignore if empty = fresh init)
-        for i, sd in enumerate(per_head_sd):
-            if sd:
-                self.v_heads[i].load_state_dict(sd, strict=False)
-
-        # 3) replicate the device-map logic from the single-head wrapper
-        if hasattr(self.pretrained_model, "hf_device_map"):
-            if (
-                "cpu" in self.pretrained_model.hf_device_map.values()
-                or "disk" in self.pretrained_model.hf_device_map.values()
-            ):
-                raise ValueError(
-                    "The model is offloaded on CPU or disk – this is not supported for ValueHead models."
-                )
-            first_device = list(set(self.pretrained_model.hf_device_map.values()))[0]
-            for head in self.v_heads:
-                head.to(first_device)
-
-            def set_device_hook(module, inputs, outputs):
-                out = tuple(o.to(first_device) if isinstance(o, torch.Tensor) else o
-                            for o in outputs)
-                return out
-
-            self.register_forward_hook(set_device_hook)
-            self.is_sequential_parallel = True
-
-        # 4) drop reference to let GC free memory
-        del state_dict
 
 def load_model_withhead(model_name, peft_name, tokenizer, device, \
         layer_type='linear', num_neurons=1024, num_layers=1, load_in_8bit=False):
 
     model_config = {
         'device_map': device,
-        'vhead_layer_type': layer_type,
-        'vhead_num_neurons': num_neurons,
-        'vhead_num_layers': num_layers,
+        'layer_type': layer_type,
+        'num_neurons': num_neurons,
+        'num_layers': num_layers,
     }
     if load_in_8bit:
         model_config['load_in_8bit'] = True
@@ -339,26 +336,27 @@ def load_model_withhead(model_name, peft_name, tokenizer, device, \
         model_config['attn_implementation'] = "flash_attention_2"
         
     model = AutoModelForCausalLMWithValueHead.from_pretrained(model_name, **model_config)
-    model.pretrained_model.resize_token_embeddings(len(tokenizer))
     model.config.pad_token_id = tokenizer.pad_token_id
+
     if len(peft_name) and os.path.exists(peft_name):
-        print(peft_name)
         peft_config = PeftConfig.from_pretrained(peft_name)
         model = PeftModel(model, peft_config)
-        loaded_state_dict = {}
 
-        safetensor_files = sorted([f for f in os.listdir(peft_name) if f.endswith('.safetensors')])
-        if len(safetensor_files):
-            for safetensor_file in safetensor_files:
-                safetensor_path = os.path.join(peft_name, safetensor_file)
-                if os.path.exists(safetensor_path):
-                    with safe_open(safetensor_path, framework="pt", device=device) as f:
-                        for k in f.keys():
-                            loaded_state_dict[k] = f.get_tensor(k)
-                            print("grm loading debug222222", k)
+        loaded_state_dict = {}
+        if os.path.exists(os.path.join(peft_name, "model.safetensors")):
+            with safe_open(os.path.join(peft_name, "model.safetensors"), framework="pt", device=device) as f:
+                for k in f.keys():
+                    loaded_state_dict[k] = f.get_tensor(k)
         else:
-            loaded_state_dict = torch.load(os.path.join(peft_name, "pytorch_model.bin"))
-            print("grm loading debug3333333")
+            loaded_state_dict = torch.load(os.path.join(peft_name, 'pytorch_model.bin'))
+        # # Check if the loaded object is a state dict or a complete model
+        # if isinstance(loaded_state_dict, dict):
+        #     # Print the keys
+        #     print(loaded_state_dict.keys())
+        # else:
+        #     # If it's a complete model, print the model parameters
+        #     print([name for name, _ in loaded_state_dict.named_parameters()])
+
         missing, unexpected = model.base_model.model.pretrained_model.load_state_dict(loaded_state_dict, strict=False)
         missing, unexpected = model.base_model.model.load_state_dict(loaded_state_dict, strict=False)
     
@@ -366,24 +364,11 @@ def load_model_withhead(model_name, peft_name, tokenizer, device, \
         model = model.merge_and_unload()
     return model
 
-def model_withhead_forward(model, input_ids, attention_mask, device, forward_type='reward', labels=None):
+def model_withhead_forward(model, input_ids, attention_mask, device, forward_type='reward'):
     if forward_type == 'reward':
         _, _, reward_tensors = model(input_ids.to(device), attention_mask=attention_mask.to(device))
     elif forward_type == 'dpo':
-        res = model(input_ids.to(device), attention_mask=attention_mask.to(device))
-        if len(res) == 3:
-            logits, _, _ = res 
-        else:
-            logits = res.logits
-        if logits.shape[:-1] != labels.shape:
-            raise ValueError("Logits (batch and sequence length dim) and labels must have the same shape.")
-
-        labels = labels[:, 1:].clone()
-        logits = logits[:, :-1, :]
-        loss_mask = labels != -100
-        labels[labels == -100] = 0
-        per_token_logps = torch.gather(logits.log_softmax(-1), dim=2, index=labels.unsqueeze(2)).squeeze(2)
-        return (per_token_logps * loss_mask).sum(-1)
+        _, reward_tensors, _ = model(input_ids.to(device), attention_mask=attention_mask.to(device))
     else:
         raise NotImplementedError
     return reward_tensors

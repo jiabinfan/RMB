@@ -209,9 +209,14 @@ class RMEnsemble():
         results = []
         with torch.no_grad():
             for i in range(len(self.peft_path_list)):
-                reward_tensors = [self.reward_models[i](x['input_ids'].to(self.gpu_ids[i])).logits[0] for x in encoded_prompt_response] 
-                results.append(torch.concat(reward_tensors).view(-1, 1))
-
+                # reward_tensors = [self.reward_models[i](x['input_ids'].to(self.gpu_ids[i])).logits[0] for x in encoded_prompt_response] 
+                # results.append(torch.concat(reward_tensors).view(-1, 1))
+                # print("len(self.peft_path_list)",len(self.peft_path_list))
+                # print("encoded_prompt_response", encoded_prompt_response.shape)
+                
+                reward_tensors = self.reward_models[i](encoded_prompt_response.to(self.gpu_ids[i])).logits[:]
+                # print(reward_tensors.shape, reward_tensors)
+                results.append(reward_tensors)
         if self.ensemble_method == 'avg':
             reward_tensors = torch.concat(results, dim=-1).mean(dim=-1)
         elif self.ensemble_method == 'min':
@@ -245,46 +250,9 @@ class RMBoost():
             for i in range(self.num_adapters):
                 reward_tensors = [self.peft_model(x['input_ids'].to(self.gpu_id), x['attention_mask'].to(self.gpu_id), active_head=i)[-1].squeeze()  for x in encoded_prompt_response] 
                 lora_rewards.append(torch.stack(reward_tensors, dim=0))
-        
-        boost_featuers = torch.stack(lora_rewards, dim=0).T     
-        reward_tensors = self.booster.inplace_predict(boost_featuers.float().cpu().numpy())
-        # print("lora_rewards", lora_rewards)
-        # print("reward features", boost_featuers.shape,boost_featuers)
-        print("reward_tensors", reward_tensors.shape,reward_tensors)
-        return torch.tensor(reward_tensors)
-
-class RMLoraEnsemble():
-    def __init__(self, one_lora_debug):
-  
-        self.booster = None
-        self.peft_model = None
-        self.rm_tokenizer = None
-        self.rm_tokenizers = None
-        self.gpu_id = None
-        self.num_adapters = 0
-        self.one_lora_debug = False
-    def load_reward_models(self, script_args, gpu_id, is_main):
-        
-        peft_model, booster, num_adapters, rm_tokenizer, rm_gpu_id = load_boost_reward_model(script_args, gpu_id, is_main)
-        self.booster = booster
-        self.peft_model = peft_model
-        self.rm_tokenizer = rm_tokenizer
-        self.gpu_id = gpu_id
-        self.num_adapters = num_adapters
-        self.rm_tokenizers = [self.rm_tokenizer]
-    def forward(self, encoded_prompt_response):
-        lora_rewards = []
-        with torch.no_grad():
-            for i in range(self.num_adapters):
-                reward_tensors = [self.peft_model(x['input_ids'].to(self.gpu_id), x['attention_mask'].to(self.gpu_id), active_head=i)[-1].squeeze()  for x in encoded_prompt_response] 
-                lora_rewards.append(torch.stack(reward_tensors, dim=0))
                 
         boost_featuers = torch.stack(lora_rewards, dim=0).T     
-        # reward_tensors = self.booster.inplace_predict(boost_featuers.float().cpu().numpy())
-        if self.one_lora_debug:
-            reward_tensors = boost_featuers[:,0]
-        else:
-            reward_tensors = boost_featuers.mean(dim=-1)
-        print("reward_tensors", reward_tensors.shape,reward_tensors)
-        print("reward features", boost_featuers.shape,boost_featuers)
+        reward_tensors = self.booster.inplace_predict(boost_featuers.float().cpu().numpy())
+        print("reward_tensors", reward_tensors)
         return torch.tensor(reward_tensors)
+    

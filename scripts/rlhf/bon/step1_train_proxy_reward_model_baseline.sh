@@ -1,11 +1,11 @@
-devices=0,1,2,3
-n_gpu=4
-
+devices=5
+n_gpu=1
+#Ray2333/reward-model-Mistral-7B-instruct-Unified-Feedback
 dataset_name='rlhf/data/unified_sampled_gold_score'
 base_model='google/gemma-2b-it'
 wandb_name="BT_RM"
-log_dir='rlhf/bon/save_reward_models'
-main_process_port=9995
+log_dir='rlhf/bon/save_reward_models/20noise'
+main_process_port=1999
 
 loss_type='bt'
 lora_r=32

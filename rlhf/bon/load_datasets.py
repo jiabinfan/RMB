@@ -6,7 +6,7 @@ from transformers import (
     AutoTokenizer,
     DataCollatorWithPadding,
 )
-
+import random
 
 def load_train_eval_dataset(data_path, tokenizer, size=None, model_name=''):
     train_dataset = build_dataset_UF(data_path, tokenizer, split='train', size=size, model_name=model_name) 
@@ -27,14 +27,24 @@ def build_dataset_UF(data_path, tokenizer, split='train', size=None, model_name=
 
     def formatting_func(example):
         kwargs = {"padding": True, "truncation": True, "max_length": tokenizer.max_length, "return_tensors": "pt"}
-        if example['conv_A_rating'] > example['conv_B_rating']:
-            chosen_messages = example['conv_A']
-            rejected_messages = example['conv_B']
-            margin = example['conv_A_rating'] - example['conv_B_rating']
+        if random.random() < 0.2 and split == "train":
+            if example['conv_A_rating'] < example['conv_B_rating']:
+                chosen_messages = example['conv_A']
+                rejected_messages = example['conv_B']
+                margin = example['conv_A_rating'] - example['conv_B_rating']
+            else:
+                chosen_messages = example['conv_B']
+                rejected_messages = example['conv_A']
+                margin = example['conv_B_rating'] - example['conv_A_rating']        
         else:
-            chosen_messages = example['conv_B']
-            rejected_messages = example['conv_A']
-            margin = example['conv_B_rating'] - example['conv_A_rating']
+            if example['conv_A_rating'] > example['conv_B_rating']:
+                chosen_messages = example['conv_A']
+                rejected_messages = example['conv_B']
+                margin = example['conv_A_rating'] - example['conv_B_rating']
+            else:
+                chosen_messages = example['conv_B']
+                rejected_messages = example['conv_A']
+                margin = example['conv_B_rating'] - example['conv_A_rating']
         
         if 'summarize' in example['source']:
             chosen_messages[0]['content'] = 'Generate one-sentence summary for the following post: ' + chosen_messages[0]['content'].strip()
@@ -87,13 +97,18 @@ def build_datasets_inference(data_path, tokenizer, split='', size=None, max_leng
     
     def formatting_func(example):
         kwargs = {"padding": 'max_length', "truncation": True, "max_length": max_length, "return_tensors": "pt"}
-        
+        # print(example)
         if not isinstance(example['output'], str):
-            answer = ''
+            answer = 'I dont know'
         else:
             answer = example['output']
+
+        if not isinstance(example['input'], str):
+            u_input = 'I dont know'
+        else:
+            u_input =  example['input']
             
-        messages = [{"role": "user", "content": example['input']},
+        messages = [{"role": "user", "content": u_input},
                 {"role": "assistant", "content": answer}]
       
         prompt_plus_response = tokenizer.apply_chat_template(messages, tokenize=False)
@@ -131,7 +146,7 @@ def build_datasets_inference(data_path, tokenizer, split='', size=None, max_leng
 def load_data2generate(data_path, tokenizer, N, debug=False):
     dataset = load_dataset(data_path, split='test')
     if debug == True:
-        dataset = dataset.select(range(0,2))
+        dataset = dataset.select(range(0,50))
     dataset = dataset.map(lambda x: {
         'id': x['id'],
         'source': x['source'],

@@ -2,6 +2,7 @@
 log_dir='rlhf/logs_ppo'
 init_kl_coef=0.00
 base_model_name="google/gemma-2b-it" # policy base model
+reward_base_model="google/gemma-2b-it" 
 dataset_path="rlhf/data/unified_20k" # set the train dataset path, refer to the BoN experiments
 eval_dataset_path="rlhf/data/unified_1k" # set the eval dataset
 

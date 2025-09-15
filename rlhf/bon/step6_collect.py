@@ -99,6 +99,7 @@ def collect():
     # Process results and save
     plot_df = process_gold_scores(filtered_results, df_gold_score, df_proxy_score)
     plot_df.to_csv('%s/results.csv'%script_args.output_path, index=False)
-
+    plot_df_proxy = processing_proxy_scores(filtered_results, df_proxy_score)
+    plot_df_proxy.to_csv('%s/results_proxy.csv'%script_args.output_path, index=False)
 if __name__ == "__main__":
     collect()

@@ -1,5 +1,5 @@
-devices=0,1,2,3,4,5
-n_gpu=6
+devices=0,2,4
+n_gpu=3
 dataset_name='llm-blender/Unified-Feedback'
 dataset_mode='40K'
 base_model='google/gemma-2b-it'

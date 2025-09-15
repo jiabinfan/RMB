@@ -342,7 +342,6 @@ def load_model_withhead(model_name, peft_name, tokenizer, device, \
     model.pretrained_model.resize_token_embeddings(len(tokenizer))
     model.config.pad_token_id = tokenizer.pad_token_id
     if len(peft_name) and os.path.exists(peft_name):
-        print(peft_name)
         peft_config = PeftConfig.from_pretrained(peft_name)
         model = PeftModel(model, peft_config)
         loaded_state_dict = {}
@@ -355,10 +354,8 @@ def load_model_withhead(model_name, peft_name, tokenizer, device, \
                     with safe_open(safetensor_path, framework="pt", device=device) as f:
                         for k in f.keys():
                             loaded_state_dict[k] = f.get_tensor(k)
-                            print("grm loading debug222222", k)
         else:
             loaded_state_dict = torch.load(os.path.join(peft_name, "pytorch_model.bin"))
-            print("grm loading debug3333333")
         missing, unexpected = model.base_model.model.pretrained_model.load_state_dict(loaded_state_dict, strict=False)
         missing, unexpected = model.base_model.model.load_state_dict(loaded_state_dict, strict=False)
     

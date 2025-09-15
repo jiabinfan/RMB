@@ -24,14 +24,21 @@ from transformers.trainer_callback import TrainerCallback
 from transformers.trainer_pt_utils import nested_detach
 from transformers.trainer_utils import EvalPrediction
 
-from trl.import_utils import is_peft_available
+#from trl.import_utils import is_peft_available
+from transformers.utils import is_peft_available
 from trl.trainer.reward_config import RewardConfig
 from trl.trainer.utils import RewardDataCollatorWithPadding, compute_accuracy
 
 
 if is_peft_available():
     from peft import PeftModel, get_peft_model, prepare_model_for_kbit_training
+    from peft.mixed_model import PeftMixedModel
 
+    def _get_base_model(self):
+        base = getattr(self, "base_model", None)
+        return getattr(base, "model", base) or self
+
+    PeftMixedModel.get_base_model = _get_base_model
 
 class RewardTrainer(Trainer):
     r"""
@@ -76,7 +83,6 @@ class RewardTrainer(Trainer):
     ):
         """
         Initialize RewardTrainer.
-
         Args:
             model (`transformers.PreTrainedModel`):
                 The model to train, preferably an `AutoModelForSequenceClassification`.

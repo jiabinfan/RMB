@@ -6,7 +6,7 @@ dataset_name='Skywork/Skywork-Reward-Preference-80K-v0.2'
 base_model='google/gemma-2b-it'
 wandb_name="BT_RM"
 log_dir='../save_reward_models'
-main_process_port=9994
+main_process_port=9991
 
 learning_rate=5e-6
 max_length=3000

@@ -6,27 +6,41 @@ reward_base_model="google/gemma-2b-it"
 dataset_path="rlhf/data/unified_20k" # set the train dataset path, refer to the BoN experiments
 eval_dataset_path="rlhf/data/unified_1k" # set the eval dataset
 
+eval_every=1
+
 cd ../../../
 
-# 4 gpus for 2b rm
-gpu=0,1
-num_processes=2
-reward_base_model="google/gemma-2b-it"
-### you need set this path
-reward_peft_path=''
+# you need set the path
+
+adapter_glob=''
+booster_out=''
+
+ensemble_method='avg'
 wandb_name=""
-CUDA_VISIBLE_DEVICES=${gpu} accelerate launch --main_process_port 10007 --num_processes ${num_processes} rlhf/ppo/ppo_grm.py \
+CUDA_VISIBLE_DEVICES=${gpu} accelerate launch --main_process_port 7121 rlhf/ppo/ppo_rmb.py \
     --base_model_name ${base_model_name} \
     --reward_base_model ${reward_base_model} \
-    --reward_peft_path ${reward_peft_path} \
     --dataset_path ${dataset_path}\
     --eval_dataset_path ${eval_dataset_path}\
+    --adapter_glob "${adapter_glob}" \
+    --booster_path ${booster_out} \
     --init_kl_coef ${init_kl_coef}\
     --log_dir ${log_dir} \
     --wandb_name ${wandb_name} \
-    --normalize_rewards True \
+    --eval_every ${eval_every} \
+    --ensemble_method ${ensemble_method} \
+    --normalize_rewards False \
     --learning_rate 1e-5 \
-    --layer_type 'mlp' --num_layers 1 \
     --mini_batch_size 1 \
     --eval_batch_size 128 \
-    --debug False
+
+
+
+
+
+
+
+   
+
+
+

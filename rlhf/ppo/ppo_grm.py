@@ -36,7 +36,7 @@ class ScriptArguments:
     base_model_name: Optional[str] = field(default='', metadata={'help':"the path to the sft model; need to merge if using lora"})
     reward_base_model: Optional[str] = field(default='')
     reward_peft_path: Optional[str] = field(default='')
-    eval_every: Optional[int] = field(default=6)
+    eval_every: Optional[int] = field(default=1)
     layer_type: Optional[str] = field(default='mlp')
     num_layers: Optional[int] = field(default=1)
     normalize_rewards: Optional[bool] = field(default=True)
@@ -163,8 +163,9 @@ for epoch in range(epochs):
 
             reward_tensors = [(x - history_mean_rm) / history_std_rm for x in reward_tensors]
             rewards = [(x - history_mean_rm) / history_std_rm for x in rewards]
-
-
+        else:
+            reward_tensors = [x for x in reward_tensors]
+            
         ppo_trainer.config.batch_size = len(query_tensors)
         stats = ppo_trainer.step(query_tensors, response_tensors, reward_tensors)
         ppo_trainer.log_stats(stats, batch, rewards)

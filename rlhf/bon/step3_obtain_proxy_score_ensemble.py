@@ -19,13 +19,14 @@ import argparse
 from load_datasets import build_datasets_inference, prepare_data_loader
 from utils import create_output_directory, adversarial_perturb
 from collections import defaultdict
+from rm_utils import load_reward_model, RMEnsemble
 
 # Add the `./reward_models` path to the system path
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../../reward_models')))
 from grm_utils import load_model_withhead, model_withhead_forward
+
 from huggingface_hub import login
 login(token="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")
-
 
 @dataclass
 class ScriptArguments:
@@ -33,9 +34,13 @@ class ScriptArguments:
     max_length: Optional[int] = field(default=1024, metadata={"help": "The maximum sequence length."})
     data_path: Optional[str] = field(default="./step3_generate_samples/generated_samples_unified", metadata={"help": "Path to the data file."})
     model_type: Optional[str] = field(default="grm", metadata={'help': "use 'grm', 'bt', 'margin', 'labelsmooth', and 'pos_reg'."})
-    base_model: Optional[str] = field(default="google/gemma-2b-it", metadata={"help": "Path to the pre-trained model."})
+    reward_base_model: Optional[str] = field(default="google/gemma-2b-it", metadata={"help": "Path to the pre-trained model."})
     peft_name: Optional[str] = field(default="./step2_train_proxy_reward_model/gemma-2b-it", metadata={"help": "PEFT model name or directory if using PEFT."})
     save_path: Optional[str] = field(default='./step4_obtain_proxy_score/gemma-2b-it', metadata={"help": "Directory to save results."})
+    ensemble_method: Optional[str] = field(default='avg')
+    reward_peft_path: Optional[str] = field(default='', metadata={'help': 'Separate each path with a comma'})
+    attn_implementation: Optional[str] = field(default="flash_attention_2", metadata={'help': "use '' if you don't want attention acceleration or meet error here."})
+
     # Only for GRM
     layer_type: Optional[str] = field(default='linear') # mlp, linear
     num_layers: Optional[int] = field(default=1)
@@ -64,11 +69,13 @@ def obtain_proxy_score():
 
     # Initialize Accelerator
     accelerator = Accelerator()
+    gpu_id= Accelerator().local_process_index 
+
     # Create output directory
     output_dir = create_output_directory(script_args.save_path, script_args.model_type)
 
     # Load tokenizer
-    tokenizer = AutoTokenizer.from_pretrained(script_args.base_model, use_fast=False)
+    tokenizer = AutoTokenizer.from_pretrained(script_args.reward_base_model, use_fast=False, use_auth_token=True)
     tokenizer.model_max_length = script_args.max_length
     tokenizer.pad_token = tokenizer.eos_token
 
@@ -84,16 +91,21 @@ def obtain_proxy_score():
     # data_loader = accelerator.prepare(data_loader)
 
     # Load model
-    if script_args.model_type == 'grm' or "grm" in  script_args.model_type:
-        model = load_model_withhead(script_args.base_model, script_args.peft_name, tokenizer, device=accelerator.local_process_index, layer_type=script_args.layer_type, num_layers=script_args.num_layers)
-    elif script_args.model_type in ['bt', 'margin', 'labelsmooth', 'pos_reg'] or "bt" in script_args.model_type:
-        model = AutoModelForSequenceClassification.from_pretrained(script_args.base_model, num_labels=1, device_map=accelerator.local_process_index, torch_dtype=torch.bfloat16)
+    if script_args.model_type == 'grm':
+        print("gpu device", accelerator.local_process_index)
+        model = load_model_withhead(script_args.reward_base_model, script_args.peft_name, tokenizer, device=accelerator.local_process_index, layer_type=script_args.layer_type, num_layers=script_args.num_layers)
+    elif script_args.model_type in ['bt', 'margin', 'labelsmooth', 'pos_reg']:
+        model = AutoModelForSequenceClassification.from_pretrained(script_args.reward_base_model, num_labels=1, device_map=accelerator.local_process_index, torch_dtype=torch.bfloat16)
         # model.resize_token_embeddings(len(tokenizer))
         # model.config.pad_token_id = tokenizer.pad_token_id
         if os.path.exists(script_args.peft_name):
             model = PeftModel.from_pretrained(model, script_args.peft_name)
         if hasattr(model, 'merge_and_unload'):
             model = model.merge_and_unload()
+    else:
+        reward_peft_model_paths = script_args.reward_peft_path.split(',')
+        reward_models = RMEnsemble(script_args.ensemble_method, base_model_name=script_args.reward_base_model, peft_path_list=reward_peft_model_paths)
+        reward_models.load_reward_models(script_args, gpu_id)
 
 
     # Run evaluation and gather results
@@ -115,18 +127,18 @@ def obtain_proxy_score():
                 )
             else:
                 pert_ids, pert_mask = batch["input_ids"],batch["attention_mask"]
-            if script_args.model_type == 'grm' or "grm" in script_args.model_type:
-                reward_tensors = model_withhead_forward(model, pert_ids, pert_mask, device, forward_type='reward') 
-
-                #reward_tensors = model_withhead_forward(model, batch["input_ids"], batch["attention_mask"], device, forward_type='reward') 
+            if script_args.model_type == 'grm':
+                reward_tensors = model_withhead_forward(model, batch["input_ids"], batch["attention_mask"], device, forward_type='reward') 
+            elif script_args.model_type == 'avg' or "avg" in script_args.model_type:
+                reward_tensors = reward_models.forward(pert_ids.to(device))
+                #reward_tensors = reward_models.forward(batch["input_ids"])
             else:
-                reward_tensors = model(pert_ids.to(device), attention_mask=pert_mask.to(device)).logits.reshape(-1)
-
-                #reward_tensors = model(batch["input_ids"].to(device), attention_mask=batch["attention_mask"].to(device)).logits.reshape(-1)
-
+                reward_tensors = model(batch["input_ids"].to(device))
+            
             full_rewards.extend(reward_tensors)
             #full_prompts.extend(batch['input_ids'])
             full_prompts.extend(pert_ids)
+
             full_source_ids.extend(batch['source'])
             full_id_ids.extend(batch['id'])
             pbar.update(1)
@@ -149,7 +161,7 @@ def obtain_proxy_score():
     for sid in all_id_ids:
         all_group_index.append(id_to_count[sid])  # 0-based index within each id group
         id_to_count[sid] += 1
-    
+        
     if accelerator.is_main_process:
         all_results = {
             'prompts': all_prompts,
@@ -157,6 +169,7 @@ def obtain_proxy_score():
             'source_ids': all_source_ids,
             'id_ids': all_id_ids,
             'idx_in_id_group': all_group_index,  # <- new column
+
         }
         df = pd.DataFrame(all_results)
         df.to_csv(os.path.join(output_dir, 'proxy_score.csv'), index=False)

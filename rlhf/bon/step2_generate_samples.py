@@ -17,6 +17,9 @@ from load_datasets import load_data2generate
 # Environment setup
 os.environ["TOKENIZERS_PARALLELISM"] = "true"
 
+import datetime, torch.distributed as dist
+dist.init_process_group(backend="nccl",
+                        timeout=datetime.timedelta(hours=20))
 
 @dataclass
 class ScriptArguments:
@@ -85,7 +88,7 @@ def generate_samples():
                    for k, v in batch.items()
                    if k in ['input_ids', 'attention_mask']}
 
-        with torch.no_grad():
+        with torch.no_grad():#.
             outputs = model.module.generate(
                 **prompts,
                 max_new_tokens=script_args.max_new_tokens,

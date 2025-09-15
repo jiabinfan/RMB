@@ -10,7 +10,7 @@ import numpy as np
 import pandas as pd          
 tqdm.pandas()
 from ppo_utils import print_trainable_parameters, collator, eval_model, build_dataset_unified, transfer_template_rm, plot_curve
-from rm_utils import load_reward_model, RMEnsemble
+from rm_utils import load_reward_model, RMEnsemble, RMBoost
 from config import get_config
 
 
@@ -41,6 +41,16 @@ class ScriptArguments:
     adap_kl_ctrl: Optional[bool] = field(default=False)
     debug: Optional[bool] = field(default=False)
 
+    layer_type: Optional[str] = field(default='mlp') # mlp, linear
+    num_layers: Optional[int] = field(default=1)
+    num_neurons: Optional[int] = field(default=1024)
+    num_adapters: Optional[int] = field(default=3)
+    adapter_glob: str = field(default="./**/adapter_*",
+                              metadata={"help": "Glob that resolves to adapter_* folders"})
+    checkpoint_dir: Optional[str] = field(default=None,
+                                          metadata={"help": "Root folder that *contains* adapter_* dirs"})
+    booster_path: str = field(default="multi_lora_booster.xgb")
+    
 parser = HfArgumentParser(ScriptArguments)
 script_args = parser.parse_args_into_dataclasses()[0]
 # Remember to use a merged sft model if using lora 
@@ -53,10 +63,12 @@ if script_args.disable_wandb: # if you don't need the wandb log
 accelerator = Accelerator()
 gpu_id= Accelerator().local_process_index 
 set_seed(8888)
+device = accelerator.device
 print('process: {}'.format(gpu_id))
 if accelerator.is_main_process and not os.path.exists(os.path.join(script_args.log_dir, script_args.wandb_name)):
     os.makedirs(os.path.join(script_args.log_dir, script_args.wandb_name))
 
+is_main = accelerator.is_main_process
 
 config = PPOConfig(
     model_name=base_model_name,
@@ -75,11 +87,12 @@ config = PPOConfig(
 
 # load reward model
 reward_peft_model_paths = script_args.reward_peft_path.split(',')
-reward_models = RMEnsemble(script_args.ensemble_method, base_model_name=base_model_name, peft_path_list=reward_peft_model_paths)
-reward_models.load_reward_models(script_args, gpu_id)
+#reward_models = RMEnsemble(script_args.ensemble_method, base_model_name=base_model_name, peft_path_list=reward_peft_model_paths)
+reward_models = RMBoost()
+reward_models.load_reward_models(script_args, device, is_main)
 
 # load tokenizer and datasets
-tokenizer = AutoTokenizer.from_pretrained(reward_peft_model_paths[0], use_fast = False)
+tokenizer = reward_models.rm_tokenizer
 train_dataset = build_dataset_unified(script_args.dataset_path, tokenizer, script_args, split='train')
 eval_dataset = build_dataset_unified(script_args.eval_dataset_path, tokenizer, script_args, split='test')
 if script_args.debug:
@@ -151,13 +164,14 @@ for epoch in range(epochs):
             encoded_prompt_response = [reward_models.rm_tokenizers[0].encode_plus(query + response, **kwargs) for query, response in temp_lis]
         
         with torch.no_grad():
+            if is_main: print("encoded_prompt_response", encoded_prompt_response[0])
             reward_tensors = reward_models.forward(encoded_prompt_response)
         rewards = [r.item() for r in reward_tensors]
-        
+
         # normalize using the first batch statistics
         if script_args.normalize_rewards:
             if epoch == 0 and i == 0:
-                all_rewards = accelerator.gather_for_metrics(rewards)
+                all_rewards =ppo_trainer.accelerator.gather_for_metrics(rewards)
                 history_mean_rm, history_std_rm = np.mean(all_rewards), np.std(all_rewards)
 
             reward_tensors = [(x - history_mean_rm) / history_std_rm for x in reward_tensors]
@@ -165,14 +179,15 @@ for epoch in range(epochs):
         else:
             reward_tensors = [x for x in reward_tensors]
 
+
         ppo_trainer.config.batch_size = len(query_tensors)
         stats = ppo_trainer.step(query_tensors, response_tensors, reward_tensors)
         ppo_trainer.log_stats(stats, batch, rewards)
         policy_kl = [stats["objective/kl"]]
 
-        all_rewards = accelerator.gather_for_metrics(rewards)
-        all_policy_kl = accelerator.gather_for_metrics(policy_kl)
-        all_lengths = accelerator.gather_for_metrics(lengths)
+        all_rewards = ppo_trainer.accelerator.gather_for_metrics(rewards)
+        all_policy_kl = ppo_trainer.accelerator.gather_for_metrics(policy_kl)
+        all_lengths = ppo_trainer.accelerator.gather_for_metrics(lengths)
         print("iter {}, batch {}: mean score: {}".format(epoch, i, np.mean(all_rewards)))
         if ppo_trainer.accelerator.is_main_process:
             mean_scores.append(np.mean(all_rewards))
