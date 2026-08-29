@@ -1,0 +1,83 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="360" viewBox="0 0 1200 360" role="img" aria-labelledby="title desc">
+  <title id="title">RMB training pipeline</title>
+  <desc id="desc">Preference pairs pass through three diverse LoRA reward models, then into a pairwise XGBoost aggregator.</desc>
+  <style>
+    .bg { fill: #101418; }
+    .panel { fill: #182026; stroke: #475569; stroke-width: 1.5; }
+    .stage { fill: #dbe4ea; font: 700 15px system-ui, sans-serif; letter-spacing: 0; }
+    .label { fill: #f8fafc; font: 700 19px system-ui, sans-serif; letter-spacing: 0; }
+    .small { fill: #b9c5ce; font: 500 13px system-ui, sans-serif; letter-spacing: 0; }
+    .formula { fill: #f8fafc; font: 600 14px ui-monospace, monospace; letter-spacing: 0; }
+    .wire { fill: none; stroke: #6b7b86; stroke-width: 2; }
+    .dash { fill: none; stroke: #f2b134; stroke-width: 3; stroke-dasharray: 8 10; animation: dash 1.8s linear infinite; }
+    .teal { fill: #1f9d8a; }
+    .amber { fill: #f2b134; }
+    .coral { fill: #e86f51; }
+    .pulse-a { animation: pulse 2.4s ease-in-out infinite; transform-origin: 462px 105px; }
+    .pulse-b { animation: pulse 2.4s .35s ease-in-out infinite; transform-origin: 462px 180px; }
+    .pulse-c { animation: pulse 2.4s .7s ease-in-out infinite; transform-origin: 462px 255px; }
+    .token { animation: travel 3.2s linear infinite; }
+    .token-b { animation-delay: -1.05s; }
+    .token-c { animation-delay: -2.1s; }
+    @keyframes dash { to { stroke-dashoffset: -36; } }
+    @keyframes pulse { 0%, 100% { transform: scale(1); opacity: .82; } 50% { transform: scale(1.08); opacity: 1; } }
+    @keyframes travel { 0% { transform: translateX(0); opacity: 0; } 12%, 82% { opacity: 1; } 100% { transform: translateX(262px); opacity: 0; } }
+    @media (prefers-reduced-motion: reduce) {
+      .dash, .pulse-a, .pulse-b, .pulse-c, .token { animation: none; }
+    }
+  </style>
+
+  <rect class="bg" width="1200" height="360" rx="8"/>
+  <text class="stage" x="56" y="42">PREFERENCE DATA</text>
+  <text class="stage" x="390" y="42">DIVERSE REWARD MODELS</text>
+  <text class="stage" x="865" y="42">BOOSTED REWARD</text>
+
+  <rect class="panel" x="48" y="72" width="245" height="216" rx="8"/>
+  <text class="label" x="78" y="112">Prompt + responses</text>
+  <rect x="78" y="139" width="184" height="46" rx="6" fill="#26313a"/>
+  <circle class="teal" cx="98" cy="162" r="7"/>
+  <text class="formula" x="116" y="167">chosen y_w</text>
+  <rect x="78" y="199" width="184" height="46" rx="6" fill="#26313a"/>
+  <circle class="coral" cx="98" cy="222" r="7"/>
+  <text class="formula" x="116" y="227">rejected y_l</text>
+  <text class="small" x="78" y="270">Human preference: y_w &gt; y_l</text>
+
+  <path class="wire" d="M293 180 H354"/>
+  <circle class="amber token" cx="306" cy="180" r="5"/>
+  <circle class="amber token token-b" cx="306" cy="180" r="5"/>
+  <circle class="amber token token-c" cx="306" cy="180" r="5"/>
+
+  <rect class="panel" x="355" y="72" width="330" height="216" rx="8"/>
+  <g class="pulse-a">
+    <rect x="388" y="82" width="148" height="46" rx="6" fill="#176f65"/>
+    <text class="label" x="410" y="111">LoRA RM 1</text>
+  </g>
+  <g class="pulse-b">
+    <rect x="388" y="157" width="148" height="46" rx="6" fill="#c28725"/>
+    <text class="label" x="410" y="186">LoRA RM 2</text>
+  </g>
+  <g class="pulse-c">
+    <rect x="388" y="232" width="148" height="46" rx="6" fill="#b84f3a"/>
+    <text class="label" x="410" y="261">LoRA RM 3</text>
+  </g>
+  <path class="wire" d="M536 105 H646 M536 180 H646 M536 255 H646"/>
+  <text class="formula" x="557" y="98">m_1</text>
+  <text class="formula" x="557" y="173">m_2</text>
+  <text class="formula" x="557" y="248">m_3</text>
+  <text class="small" x="557" y="273">BT loss + margin HSIC</text>
+
+  <path class="dash" d="M685 180 H815"/>
+
+  <rect class="panel" x="816" y="72" width="336" height="216" rx="8"/>
+  <rect x="850" y="98" width="116" height="72" rx="6" fill="#26313a" stroke="#f2b134" stroke-width="2"/>
+  <path d="M878 120 H938 M908 120 V145 M882 145 H934" fill="none" stroke="#f2b134" stroke-width="3"/>
+  <text class="small" x="866" y="194">Pairwise trees</text>
+  <text class="formula" x="997" y="126">F_K(R)</text>
+  <text class="small" x="997" y="150">residual</text>
+  <text class="small" x="997" y="170">correction</text>
+  <rect x="850" y="221" width="266" height="42" rx="6" fill="#176f65"/>
+  <text class="label" x="880" y="248">Robust scalar reward</text>
+
+  <text class="small" x="48" y="329">Stage 1: complementary margins</text>
+  <text class="small" x="866" y="329">Stage 2: leakage-free stacking</text>
+</svg>

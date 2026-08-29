@@ -21,6 +21,10 @@ class RewardDataCollatorWithPadding:
     def __call__(self, features: List[Dict[str, Any]]) -> Dict[str, Any]:
         merged_features = []
         margins = []
+        has_preference_targets = any(
+            "preference_target" in feature for feature in features
+        )
+        preference_targets = []
         for feature in features:
             merged_features.append(
                 {
@@ -36,6 +40,12 @@ class RewardDataCollatorWithPadding:
             )
             if 'margin' in feature.keys():
                 margins.append(feature['margin'])
+            if has_preference_targets:
+                # Mixed RRM batches may contain original pairs (target=1) and
+                # neutral cross-context pairs (target=0.5).
+                preference_targets.append(
+                    float(feature.get("preference_target", 1.0))
+                )
         batch = self.tokenizer.pad(
             merged_features,
             padding=self.padding,
@@ -49,6 +59,11 @@ class RewardDataCollatorWithPadding:
             "return_loss": True,
             "margin": margins,
         }
+        # Preserve the exact legacy batch schema for every pre-RRM dataset.
+        if has_preference_targets:
+            batch["preference_target"] = torch.tensor(
+                preference_targets, dtype=torch.float32
+            )
         return batch
 
 
@@ -68,7 +83,16 @@ class SimpleRewardTrainer(RewardTrainer):
         rewards_k = rewards[kidx]
 
         if self.loss_type == 'bt':
-            loss = - nn.functional.logsigmoid(rewards_j - rewards_k).mean() 
+            target = inputs.get("preference_target")
+            if target is None:
+                loss = -nn.functional.logsigmoid(rewards_j - rewards_k).mean()
+            else:
+                target = target.to(
+                    device=rewards_j.device, dtype=rewards_j.dtype
+                ).reshape_as(rewards_j)
+                loss = nn.functional.binary_cross_entropy_with_logits(
+                    rewards_j - rewards_k, target
+                )
         elif self.loss_type == 'pos_reg':
             loss = - nn.functional.logsigmoid(rewards_j - rewards_k).mean() - self.weight_ratio * nn.functional.logsigmoid(rewards_j.mean())
         elif self.loss_type == 'margin':

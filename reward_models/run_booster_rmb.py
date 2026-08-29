@@ -1,451 +1,565 @@
 #!/usr/bin/env python
-# -*- coding: utf-8 -*-
+"""Fit a pairwise XGBoost ranker on rewards from multiple LoRA/value heads."""
 
-import os, glob, json, math, numpy as np, torch, xgboost as xgb
-from pathlib import Path
+import glob
 from dataclasses import dataclass, field
-from typing import List, Optional
-from accelerate import Accelerator
-from tqdm.auto import tqdm
-from transformers import (
-    AutoTokenizer, AutoModelForSequenceClassification, HfArgumentParser
+from datetime import timedelta
+from pathlib import Path
+from typing import Optional
+
+import numpy as np
+import torch
+import xgboost as xgb
+from accelerate import Accelerator, InitProcessGroupKwargs
+from peft import (
+    LoraConfig,
+    get_peft_model,
+    set_peft_model_state_dict,
 )
+from safetensors.torch import load_file
 from torch.utils.data import DataLoader
-import torch.nn as nn
-from peft import PeftModel
+from tqdm.auto import tqdm
+from transformers import AutoTokenizer, HfArgumentParser
+
 from grm_utils import AutoModelForCausalLMWithMultiValueHead
-from peft import PeftModel, LoraConfig, set_peft_model_state_dict
-from peft import LoraConfig, TaskType, get_peft_model
-# ──────────────────────────────────────────────────────────────────────────
-# 1 · CLI / script arguments
-# ──────────────────────────────────────────────────────────────────────────
+
+
 @dataclass
 class ScriptArguments:
-    # LoRA / checkpoint selection
     checkpoint_dir: Optional[str] = field(
         default=None,
-        metadata={"help": "Folder that contains adapter_0/, adapter_1/, …"}
+        metadata={"help": "Explicit folder containing adapter_0, adapter_1, ..."},
     )
     adapter_glob: str = field(
         default="./reward_models_train/**/best_step_*_acc*/",
-        metadata={"help": "Fallback glob to locate checkpoints if --checkpoint_dir is not given"}
+        metadata={"help": "Checkpoint path or fallback glob"},
     )
-
-    # base model + runtime
     base_model: str = field(default="google/gemma-2b-it")
     max_length: int = field(default=1024)
     batch_size: int = field(default=8)
     bf16: bool = field(default=True)
     fp16: bool = field(default=False)
-    attn_implementation: str = field(default="flash_attention_2")
-    freeze_pretrained: bool = field(default=True)
+    attn_implementation: str = field(default="sdpa")
 
-    # XGBoost parameters
-    tree_method: str = field(default="gpu_hist", metadata={"help": "'gpu_hist' or 'hist'"})
-    num_round: int = field(default=300)
+    tree_method: str = field(default="gpu_hist")
+    num_round: int = field(default=256)
     early_stopping: int = field(default=20)
     booster_out: str = field(default="multi_lora_booster.xgb")
-    xgb_max_depth: int = field(default=3)
+    xgb_max_depth: int = field(default=5)
     xgb_eta: float = field(default=0.05)
-    
-    layer_type: Optional[str] = field(default='mlp') # mlp, linear
-    num_layers: Optional[int] = field(default=1)
-    num_neurons: Optional[int] = field(default=1024)
-    # dataset
+    xgb_min_child_weight: float = field(default=30.0)
+    xgb_gamma: float = field(default=2.0)
+    xgb_reg_lambda: float = field(default=0.1)
+    distributed_timeout_minutes: int = field(default=1200)
+
+    layer_type: Optional[str] = field(default="mlp")
+    num_layers: int = field(default=1)
+    num_neurons: int = field(default=1024)
     dataset: str = field(default="llm-blender/Unified-Feedback")
     eval_dataset: str = field(default="llm-blender/Unified-Feedback")
-    dataset_mode: str = field(default="40k")
-    
+    dataset_mode: str = field(default="40K-heldout")
+    max_train_samples: Optional[int] = field(
+        default=None, metadata={"help": "Optional extraction cap for smoke tests"}
+    )
+    max_eval_samples: Optional[int] = field(
+        default=None, metadata={"help": "Optional validation cap for smoke tests"}
+    )
+
+
+@dataclass(frozen=True)
+class AdapterCheckpoint:
+    index: int
+    name: str
+    outer_dir: Path
+    weights_dir: Path
+    value_head_path: Path
+
+
 class PairAccCB(xgb.callback.TrainingCallback):
-    """Compute pair-wise accuracy on `dvalid` each round; store in self.curr_acc."""
-    def __init__(self, dvalid):
+    """Evaluate, save and early-stop on pair accuracy in one ordered callback."""
+
+    def __init__(self, dvalid, checkpoint_path, early_stopping):
         self.dvalid = dvalid
-        self.gptr   = dvalid.get_uint_info("group_ptr")
+        self.group_ptr = dvalid.get_uint_info("group_ptr")
+        if len(self.group_ptr) < 2 or not np.all(np.diff(self.group_ptr) == 2):
+            raise ValueError("Pair accuracy requires every XGBoost group to have size 2")
         self.curr_acc = 0.0
+        self.best_acc = -1.0
+        self.best_iteration = -1
+        self.checkpoint_path = Path(checkpoint_path)
+        self.early_stopping = early_stopping
 
     def after_iteration(self, model, epoch, evals_log):
         pred = model.predict(self.dvalid)
-        correct = sum(pred[a] > pred[a+1]                   # row order = [chosen, rejected]
-                      for a in self.gptr[:-1])              # one a per group
-        self.curr_acc = correct / (len(self.gptr) - 1)
-        print(f"[{epoch}]  val-pair_acc: {self.curr_acc:.4f}")
-        return False                                        # keep training
-
-
-class SaveBestAccCB(xgb.callback.TrainingCallback):
-    """Save the booster whenever PairAccCB achieves a new high score."""
-    def __init__(self, pair_cb: PairAccCB, ckpt_path: str, rank_zero: bool = True):
-        self.pair_cb   = pair_cb
-        self.best_acc  = -1.0
-        self.ckpt_path = ckpt_path
-        self.rank_zero = rank_zero
-
-    def after_iteration(self, model, epoch, evals_log):
-        acc = self.pair_cb.curr_acc
-        if acc > self.best_acc + 1e-7:          # small tolerance
-            self.best_acc = acc
-            if self.rank_zero:
-                model.save_model(self.ckpt_path)
-                print(f"[{epoch}]  ▲ new best acc = {acc:.4f} ➜ saved to {self.ckpt_path}")
-        return False
-
-from pathlib import Path
-import torch
-from peft import PeftModel, set_peft_model_state_dict
-from safetensors.torch import load_file
-
-PREFIX_WRONG = "base_model.model.pretrained_model.model."
-PREFIX_RIGHT = "base_model.model.pretrained_model.model."
-# def _fix_keys(sd, dtype):
-#     """strip extra prefix + cast"""
-#     return {k.replace(PREFIX_WRONG, PREFIX_RIGHT, 1): v.to(dtype)
-#             for k, v in sd.items()}
-def _fix_keys(sd, dtype):
-    new_sd = {}
-    for k, v in sd.items():
-        if ".pretrained_model." not in k:       # ← old checkpoints
-            k = k.replace(
-                "base_model.model.model.",
-                "base_model.model.pretrained_model.model.", 1
+        starts = self.group_ptr[:-1]
+        self.curr_acc = float(np.mean(pred[starts] > pred[starts + 1]))
+        print(f"[{epoch}] val-pair_acc: {self.curr_acc:.4f}")
+        if self.curr_acc > self.best_acc + 1e-7:
+            self.best_acc = self.curr_acc
+            self.best_iteration = epoch
+            self.checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+            model.set_attr(
+                feature_mode="response",
+                best_iteration=str(epoch),
+                best_pair_accuracy=f"{self.curr_acc:.8f}",
             )
-        new_sd[k] = v.to(dtype)
-    return new_sd
+            model.save_model(str(self.checkpoint_path))
+            print(
+                f"[{epoch}] new best pair accuracy {self.curr_acc:.4f}; "
+                f"saved to {self.checkpoint_path}"
+            )
+        return (
+            self.early_stopping > 0
+            and epoch - self.best_iteration >= self.early_stopping
+        )
 
-def load_adapters_and_head(base_model, ckpt_root, device, dtype=torch.bfloat16):
-    root = Path(ckpt_root).expanduser().resolve()
-    if not root.is_dir():
-        raise FileNotFoundError(root)
 
-    # ── collect adapter_* directories in numeric order ───────────────
-    adirs = sorted(root.glob("adapter_*"),
-                   key=lambda p: int(p.name.split("_")[1]))
-    if not adirs:
-        raise RuntimeError(f"No adapter_* dirs found in {root}")
+def resolve_checkpoint_root(
+    checkpoint_dir: Optional[str], adapter_glob: str
+) -> Path:
+    """Resolve an explicit checkpoint directory or the first glob match."""
+    candidate = checkpoint_dir or adapter_glob
+    direct = Path(candidate).expanduser()
+    if direct.is_dir():
+        return direct.resolve()
 
-    # ── 1️⃣ wrap base model with the *first* adapter (empty weights) ──
-    model = PeftModel.from_pretrained(
+    matches = sorted(
+        Path(path).expanduser().resolve()
+        for path in glob.glob(candidate, recursive=True)
+        if Path(path).is_dir()
+    )
+    if not matches:
+        raise FileNotFoundError(f"No checkpoint directory matches {candidate!r}")
+    if len(matches) > 1:
+        print(f"Found {len(matches)} checkpoints; using {matches[0]}")
+    return matches[0]
+
+
+def discover_adapter_checkpoints(root: Path) -> list[AdapterCheckpoint]:
+    """Discover nested and legacy-flat LoRA/value-head checkpoint layouts."""
+    adapters = []
+    for outer in root.glob("adapter_*"):
+        if not outer.is_dir():
+            continue
+        suffix = outer.name.removeprefix("adapter_")
+        if not suffix.isdigit():
+            continue
+
+        index = int(suffix)
+        name = f"adapter_{index}"
+        weights_dir = next(
+            (
+                path
+                for path in (outer / name, outer)
+                if (path / "adapter_config.json").is_file()
+                and (path / "adapter_model.safetensors").is_file()
+            ),
+            None,
+        )
+        if weights_dir is None:
+            raise FileNotFoundError(
+                f"{outer} has no complete LoRA payload. Expected both "
+                "adapter_config.json and adapter_model.safetensors."
+            )
+
+        value_head_path = next(
+            (
+                path
+                for path in (outer / "v_head.bin", weights_dir / "v_head.bin")
+                if path.is_file()
+            ),
+            None,
+        )
+        if value_head_path is None:
+            raise FileNotFoundError(f"No v_head.bin found for {name} in {outer}")
+
+        adapters.append(
+            AdapterCheckpoint(
+                index=index,
+                name=name,
+                outer_dir=outer,
+                weights_dir=weights_dir,
+                value_head_path=value_head_path,
+            )
+        )
+
+    adapters.sort(key=lambda item: item.index)
+    if not adapters:
+        raise RuntimeError(f"No adapter_N directories found in {root}")
+
+    indices = [item.index for item in adapters]
+    expected = list(range(len(adapters)))
+    if indices != expected:
+        raise ValueError(
+            f"Adapters must be contiguous and zero-based; found {indices}, "
+            f"expected {expected}"
+        )
+    return adapters
+
+
+def _fix_lora_keys(state, dtype):
+    """Map legacy wrapper prefixes to the current multi-value-head wrapper."""
+    fixed = {}
+    for key, value in state.items():
+        if ".pretrained_model." not in key:
+            key = key.replace(
+                "base_model.model.model.",
+                "base_model.model.pretrained_model.model.",
+                1,
+            )
+        fixed[key] = value.to(dtype)
+    return fixed
+
+
+def load_adapters_and_heads(
+    base_model, adapters: list[AdapterCheckpoint], device, dtype
+):
+    """Load all LoRA adapters and their matching value heads."""
+    first = adapters[0]
+    first_config = LoraConfig.from_pretrained(first.weights_dir)
+    model = get_peft_model(
         base_model,
-        adirs[0] / "adapter_0",                    # supplies the LoRA config
-        adapter_name=adirs[0].name,
-        load_weights=False,          # ← we’ll load them manually
-        is_trainable=False,
-        device_map={"": device},
-        torch_dtype=dtype,
+        first_config,
+        adapter_name=first.name,
+        mixed=False,
     )
 
-    # ── 2️⃣ register + load every adapter’s weights ──────────────────
-    for adir in adirs:
-        tmp_adp_name = "adapter_" +adir.name[-1] 
-        adir = adir /  tmp_adp_name 
-        name = adir.name              # e.g. adapter_1
-        if name not in model.peft_config:     # first one is already there
-            cfg = LoraConfig.from_pretrained(adir)
-            model.add_adapter(name, cfg)
+    for adapter in adapters:
+        if adapter.name not in model.peft_config:
+            config = LoraConfig.from_pretrained(adapter.weights_dir)
+            model.add_adapter(adapter.name, config)
 
-        sd = load_file(adir / "adapter_model.safetensors", device="cpu")
-        print("\n".join(list(sd.keys())[:10]))  # show the first 10 keys
-        set_peft_model_state_dict(model, _fix_keys(sd, dtype), adapter_name=name)
+        lora_state = load_file(
+            adapter.weights_dir / "adapter_model.safetensors", device="cpu"
+        )
+        set_peft_model_state_dict(
+            model,
+            _fix_lora_keys(lora_state, dtype),
+            adapter_name=adapter.name,
+        )
 
-    # ── 3️⃣ load the shared value head AFTER the PEFT wrapping ───────
-    for adir in adirs:
-        idx = int(adir.name.split("_")[1])
-        v_path = adir / "v_head.bin"
-        if v_path.exists():
-            v_sd = torch.load(v_path, map_location="cpu")
-            model.v_heads[idx].load_state_dict(v_sd, strict=True)
-        else:
-            raise FileNotFoundError(v_path)
+        head_state = torch.load(
+            adapter.value_head_path, map_location="cpu", weights_only=True
+        )
+        model.v_heads[adapter.index].load_state_dict(head_state, strict=True)
+        print(
+            f"Loaded {adapter.name}: {len(lora_state)} LoRA tensors and "
+            f"{len(head_state)} value-head tensors"
+        )
 
-
-    model.set_adapter(adirs[0].name)      # default active
+    model.set_adapter(first.name)
     return model.to(device)
 
-from safetensors.torch import load_file
-import torch
 
-def verify_lora_adapters(peft_model, checkpoint_dir):
-    """
-    Verifies that the loaded LoRA adapter weights in the PeftModel match the
-    weights saved in the .safetensors files on disk.
+def load_checkpoint_tokenizer(checkpoint_root: Path, base_model: str, max_length: int):
+    """Prefer the training tokenizer and fail clearly if no chat template exists."""
+    errors = []
+    tokenizer = None
+    for source in (str(checkpoint_root), base_model):
+        try:
+            tokenizer = AutoTokenizer.from_pretrained(source, use_fast=False)
+            print(f"Loaded tokenizer from {source}")
+            break
+        except Exception as exc:
+            errors.append(f"{source}: {exc}")
+    if tokenizer is None:
+        raise RuntimeError("Could not load tokenizer:\n" + "\n".join(errors))
 
-    Args:
-        peft_model (PeftModel): The model with loaded adapters.
-        checkpoint_dir (str): The root directory containing the adapter folders.
-    """
-    print("\n--- Verifying LoRA Adapter Weights ---")
-    live_state_dict = peft_model.state_dict()
-    root = Path(checkpoint_dir).expanduser().resolve()
-    
-    # Iterate over each adapter configured in the live model
-    for adapter_name in peft_model.peft_config.keys():
-        print(f"Verifying '{adapter_name}'...")
-        
-        adapter_file = root / adapter_name / "adapter_model.safetensors"
-        if not adapter_file.exists():
-            print(f"  └── ❌ ERROR: Cannot find file at {adapter_file}")
-            continue
-
-        # Load the state dict from the .safetensors file
-        disk_state_dict = load_file(adapter_file, device="cpu")
-        
-        mismatched_params = 0
-        # For each parameter in the saved file, check it against the live model
-        for param_key, disk_tensor in disk_state_dict.items():
-            if param_key not in live_state_dict:
-                print(f"  └── ❓ WARNING: Parameter '{param_key}' found on disk but not in live model.")
-                continue
-
-            live_tensor = live_state_dict[param_key]
-            
-            # Compare the tensors
-            if not torch.allclose(live_tensor.cpu(), disk_tensor):
-                print(f"  └── ❌ MISMATCH found for parameter: {param_key}")
-                mismatched_params += 1
-        
-        if mismatched_params == 0:
-            print(f"  └── ✅ OK: All parameters for '{adapter_name}' match the file on disk.")
-        else:
-            print(f"  └── ❌ FAILED: {mismatched_params} parameters for '{adapter_name}' did not match.")
-
-def verify_value_head(peft_model, checkpoint_dir):
-    """
-    Verifies that the loaded value head weights in the model match the
-    weights saved in the v_head.bin file on disk.
-
-    Args:
-        peft_model (PeftModel): The model containing the value head.
-        checkpoint_dir (str): The root directory containing v_head.bin.
-    """
-    print("\n--- Verifying Value Head Weights ---")
-    root = Path(checkpoint_dir).expanduser().resolve()
-    v_head_file = root / "v_head.bin"
-
-    if not v_head_file.exists():
-        print(f"  └── ❌ ERROR: Cannot find file at {v_head_file}")
-        return
-
-    # Load from .bin file
-    disk_state_dict = torch.load(v_head_file, map_location="cpu")
-    # Get live state dict from the model's value head
-    live_state_dict = peft_model.v_head.state_dict()
-
-    mismatched_params = 0
-    for param_key, disk_tensor in disk_state_dict.items():
-        if param_key not in live_state_dict:
-            print(f"  └── ❓ WARNING: Parameter '{param_key}' found on disk but not in live model's v_head.")
-            continue
-        
-        live_tensor = live_state_dict[param_key]
-        if not torch.allclose(live_tensor.cpu().float(), disk_tensor):
-            print(f"  └── ❌ MISMATCH found for v_head parameter: {param_key}")
-            mismatched_params += 1
-            
-    if mismatched_params == 0:
-        print("  └── ✅ OK: All value head parameters match the file on disk.")
-    else:
-        print(f"  └── ❌ FAILED: {mismatched_params} value head parameters did not match.")
-# ──────────────────────────────────────────────────────────────────────────
-# 3 · Dataset wrappers
-# ──────────────────────────────────────────────────────────────────────────
-from datasets import concatenate_datasets          # new import
-from load_datasets import load_train_eval_dataset 
-from load_eval_datasets import load_eval_dataset
-
-def _set_active_adapter(wrapped, name: str):
-    if hasattr(wrapped, "module"):
-        wrapped.module.set_adapter(name)
-    else:
-        wrapped.set_adapter(name)
-def lora_stats(model, adapter_name="adapter_0", n=5):
-    keys = [k for k,_ in model.named_parameters() if f".{adapter_name}." in k]
-    print("found", len(keys), "LoRA tensors for", adapter_name)
-    for k in keys[:n]:
-        t = dict(model.named_parameters())[k]
-        print(f"{k}  mean|abs| = {t.float().cpu().double().abs().mean() :.4e}")
-
-# ──────────────────────────────────────────────────────────────────────────
-# 2 · Helper functions
-# ──────────────────────────────────────────────────────────────────────────
-def collate_fn(tokenizer, batch, max_len):
-    pad_id = tokenizer.pad_token_id
-    keys = ["input_ids_chosen", "attention_mask_chosen",
-            "input_ids_rejected", "attention_mask_rejected"]
-    out = {}
-    for k in keys:
-        out[k] = torch.nn.utils.rnn.pad_sequence(
-            [torch.tensor(ex[k][:max_len]) for ex in batch],
-            batch_first=True, padding_value=pad_id
+    if tokenizer.pad_token_id is None:
+        if tokenizer.eos_token_id is None:
+            raise ValueError("Tokenizer has neither a pad token nor an EOS token")
+        tokenizer.pad_token = tokenizer.eos_token
+    if not getattr(tokenizer, "chat_template", None):
+        raise ValueError(
+            "Tokenizer has no chat template. Save the tokenizer used for reward-model "
+            "training in the checkpoint instead of guessing a model-specific template."
         )
-    return out
+
+    tokenizer.max_length = max_length
+    tokenizer.model_max_length = max_length
+    return tokenizer
 
 
-# ──────────────────────────────────────────────────────────────────────────
-# 3 · Main
-# ──────────────────────────────────────────────────────────────────────────
+def _to_list(value):
+    if isinstance(value, torch.Tensor):
+        return value.detach().cpu().tolist()
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    return list(value)
+
+
+def _truncate(values, max_length, side):
+    if len(values) <= max_length:
+        return values
+    if side == "left":
+        return values[-max_length:]
+    return values[:max_length]
+
+
+def _pair_features(tokenizer, batch, side, max_length):
+    features = []
+    id_key = f"input_ids_{side}"
+    mask_key = f"attention_mask_{side}"
+    truncation_side = getattr(tokenizer, "truncation_side", "right")
+
+    for row_number, example in enumerate(batch):
+        input_ids = _to_list(example[id_key])
+        attention_mask = _to_list(example[mask_key])
+        if len(input_ids) != len(attention_mask):
+            raise ValueError(
+                f"{side} row {row_number}: input length {len(input_ids)} != "
+                f"attention-mask length {len(attention_mask)}"
+            )
+
+        input_ids = _truncate(input_ids, max_length, truncation_side)
+        attention_mask = _truncate(attention_mask, max_length, truncation_side)
+        attention_mask = [1 if int(value) != 0 else 0 for value in attention_mask]
+        if not input_ids or not any(attention_mask):
+            raise ValueError(f"{side} row {row_number} is empty after truncation")
+
+        lowest, highest = min(input_ids), max(input_ids)
+        if lowest < 0 or highest >= len(tokenizer):
+            raise ValueError(
+                f"{side} row {row_number} has token IDs [{lowest}, {highest}], "
+                f"outside tokenizer vocabulary [0, {len(tokenizer) - 1}]"
+            )
+        features.append(
+            {"input_ids": input_ids, "attention_mask": attention_mask}
+        )
+
+    padded = tokenizer.pad(features, padding=True, return_tensors="pt")
+    mask = padded["attention_mask"].to(dtype=torch.long)
+    if not torch.all((mask == 0) | (mask == 1)):
+        raise ValueError(f"{side} attention mask is not binary after padding")
+    return padded["input_ids"].to(dtype=torch.long), mask
+
+
+def collate_fn(tokenizer, batch, max_length):
+    """Token-aware pair collation with correct mask padding for any pad token ID."""
+    if not batch:
+        raise ValueError("Cannot collate an empty batch")
+    chosen_ids, chosen_mask = _pair_features(
+        tokenizer, batch, "chosen", max_length
+    )
+    rejected_ids, rejected_mask = _pair_features(
+        tokenizer, batch, "rejected", max_length
+    )
+    return {
+        "input_ids_chosen": chosen_ids,
+        "attention_mask_chosen": chosen_mask,
+        "input_ids_rejected": rejected_ids,
+        "attention_mask_rejected": rejected_mask,
+    }
+
+
+def _set_active_adapter(model, name):
+    (model.module if hasattr(model, "module") else model).set_adapter(name)
+
+
+def _model_dtype(args):
+    if args.bf16 and args.fp16:
+        raise ValueError("Choose at most one of --bf16 and --fp16")
+    if args.bf16:
+        return torch.bfloat16
+    if args.fp16:
+        return torch.float16
+    return torch.float32
+
+
+def _xgboost_device_params(tree_method):
+    """Translate legacy gpu_hist to the XGBoost 2.x device API."""
+    major_version = int(xgb.__version__.split(".", 1)[0])
+    if tree_method == "gpu_hist" and major_version >= 2:
+        return {"tree_method": "hist", "device": "cuda"}
+    return {"tree_method": tree_method}
+
+
 def main():
     args = HfArgumentParser(ScriptArguments).parse_args_into_dataclasses()[0]
-    accelerator = Accelerator()
+    accelerator = Accelerator(
+        kwargs_handlers=[
+            InitProcessGroupKwargs(
+                timeout=timedelta(minutes=args.distributed_timeout_minutes)
+            )
+        ]
+    )
     device = accelerator.device
     is_main = accelerator.is_main_process
 
-    # 4.2  – tokenizer & base LM
-    tokenizer = AutoTokenizer.from_pretrained(args.base_model, use_fast=False)
-    tokenizer.max_length = args.max_length
-    tokenizer.pad_token = tokenizer.pad_token or tokenizer.eos_token
+    checkpoint_root = resolve_checkpoint_root(
+        args.checkpoint_dir, args.adapter_glob
+    )
+    adapters = discover_adapter_checkpoints(checkpoint_root)
+    tokenizer = load_checkpoint_tokenizer(
+        checkpoint_root, args.base_model, args.max_length
+    )
+    dtype = _model_dtype(args)
 
     model_params = {
-        'vhead_layer_type': args.layer_type,
-        'vhead_num_neurons': 1024,
-        'vhead_num_layers': args.num_layers,
+        "vhead_layer_type": args.layer_type,
+        "vhead_num_neurons": args.num_neurons,
+        "vhead_num_layers": args.num_layers,
     }
-
-    adapter_root = Path(args.adapter_glob or ".")
-    n_adapters = len(list(adapter_root.glob("adapter_*")))
-    print("num heads", n_adapters)
     base = AutoModelForCausalLMWithMultiValueHead.from_pretrained(
-        args.base_model, device_map=device, 
-        torch_dtype=torch.bfloat16,
-        num_value_heads=n_adapters,
+        args.base_model,
+        device_map=device,
+        torch_dtype=dtype,
+        num_value_heads=len(adapters),
+        attn_implementation=args.attn_implementation,
         **model_params,
     )
-
     base.pretrained_model.resize_token_embeddings(len(tokenizer))
-    # print_trainable_parameters(base)
     base.config.pad_token_id = tokenizer.pad_token_id
-    
+    model = load_adapters_and_heads(base, adapters, device, dtype)
+    adapter_names = [adapter.name for adapter in adapters]
+    if is_main:
+        print(
+            f"Loaded {len(adapters)} adapters from {checkpoint_root}; "
+            f"padding_side={tokenizer.padding_side}, dtype={dtype}"
+        )
 
-    resume_dir = args.adapter_glob
-    model = load_adapters_and_head(base, resume_dir, device)
-    print("Loaded adapters:", list(model.peft_config.keys()))
+    # Keep the Arrow/datasets dependency lazy so checkpoint and collator
+    # utilities remain importable in lightweight CPU environments.
+    from load_datasets import load_train_eval_dataset
 
-    # lora_stats(model, "adapter_0")
-    # lora_stats(model, "adapter_1")
-    # lora_stats(model, "adapter_2")
-    n_adapters = len(model.peft_config)
-    if is_main: print(f"✓ loaded {n_adapters} LoRA adapters")
-
-    # -------------------------------------------------------------
-    # 3.5 Load dataset
-    # -------------------------------------------------------------
-    from load_datasets import load_train_eval_dataset  # project helper
     train_ds, _ = load_train_eval_dataset(
-        args.dataset, tokenizer, mode=args.dataset_mode
+        args.dataset,
+        tokenizer,
+        size=args.max_train_samples,
+        mode=args.dataset_mode,
+        load_eval=False,
     )
-
     _, eval_ds = load_train_eval_dataset(
-        args.eval_dataset, tokenizer, mode=args.dataset_mode
+        args.eval_dataset,
+        tokenizer,
+        size=args.max_eval_samples,
+        mode=args.dataset_mode,
+        load_train=False,
     )
-    
-    dl_train = DataLoader(
-        train_ds, batch_size=args.batch_size, shuffle=True,
-        collate_fn=lambda b: collate_fn(tokenizer, b, args.max_length)
+    if args.max_train_samples is not None:
+        train_ds = train_ds.select(
+            range(min(args.max_train_samples, len(train_ds)))
+        )
+    if args.max_eval_samples is not None:
+        eval_ds = eval_ds.select(range(min(args.max_eval_samples, len(eval_ds))))
+    if is_main:
+        print(f"Dataset sizes: train={len(train_ds)}, validation={len(eval_ds)}")
+    train_loader = DataLoader(
+        train_ds,
+        batch_size=args.batch_size,
+        shuffle=True,
+        collate_fn=lambda rows: collate_fn(tokenizer, rows, args.max_length),
     )
-    dl_eval = DataLoader(
-        eval_ds, batch_size=args.batch_size, shuffle=False,
-        collate_fn=lambda b: collate_fn(tokenizer, b, args.max_length)
+    eval_loader = DataLoader(
+        eval_ds,
+        batch_size=args.batch_size,
+        shuffle=False,
+        collate_fn=lambda rows: collate_fn(tokenizer, rows, args.max_length),
     )
-    dl_train, dl_eval = accelerator.prepare(dl_train, dl_eval)
+    train_loader, eval_loader = accelerator.prepare(train_loader, eval_loader)
 
-    # -------------------------------------------------------------
-    # 3.6 Feature extraction
-    # -------------------------------------------------------------
-    def gather_pairwise_features(loader):
-        """
-        Build proper pair-wise data:
-            Row-0 = chosen  (label 1)
-            Row-1 = rejected(label 0)
-        Order is interleaved so each query-group consists of 2 consecutive rows.
-        """
-        feat_rows, labels, group_sizes = [], [], []
+    def gather_pairwise_features(loader, description):
+        feature_rows, labels, group_sizes = [], [], []
         model.eval()
 
-        for batch in tqdm(loader, disable=not is_main, desc="⟨GPU⟩ extract"):
+        for batch in tqdm(loader, disable=not is_main, desc=description):
             with torch.inference_mode():
-                pos_cols, neg_cols = [], []
-                for a in range(n_adapters):
-                    adapter_name = f"adapter_{a}"
+                chosen_columns, rejected_columns = [], []
+                for head_index, adapter_name in enumerate(adapter_names):
                     _set_active_adapter(model, adapter_name)
-                    r_pos = model(batch["input_ids_chosen"],
-                                attention_mask=batch["attention_mask_chosen"], active_head=a)[-1].squeeze()
-                    r_neg = model(batch["input_ids_rejected"],
-                                attention_mask=batch["attention_mask_rejected"], active_head=a)[-1].squeeze()
-                    pos_cols.append(r_pos)
-                    neg_cols.append(r_neg)
+                    chosen_reward = model(
+                        batch["input_ids_chosen"],
+                        attention_mask=batch["attention_mask_chosen"],
+                        active_head=head_index,
+                    )[-1].reshape(-1)
+                    rejected_reward = model(
+                        batch["input_ids_rejected"],
+                        attention_mask=batch["attention_mask_rejected"],
+                        active_head=head_index,
+                    )[-1].reshape(-1)
+                    chosen_columns.append(chosen_reward)
+                    rejected_columns.append(rejected_reward)
 
-                # (B, N) matrices
-                # print(pos_cols)
-                pos_mat = torch.stack(pos_cols, dim=1)   # chosen
-                neg_mat = torch.stack(neg_cols, dim=1)   # rejected
+                chosen_matrix = torch.stack(chosen_columns, dim=1)
+                rejected_matrix = torch.stack(rejected_columns, dim=1)
+                # Gather while dimension 0 still means dataset pairs. Accelerate
+                # can then remove duplicated tail samples correctly on the last
+                # distributed batch. Gathering after flattening to 2*B rows
+                # would apply the pair remainder to reward rows and corrupt
+                # XGBoost group boundaries.
+                gathered_pairs = accelerator.gather_for_metrics(
+                    torch.stack([chosen_matrix, rejected_matrix], dim=1)
+                )
+                pair_features = gathered_pairs.reshape(-1, len(adapters))
+                pair_labels = torch.tensor(
+                    [1, 0], device=device, dtype=torch.long
+                ).repeat(gathered_pairs.shape[0])
 
-                # ── interleave:  (B, 2, N)  →  (2B, N) ────────────────────────
-                pair_feat = torch.stack([pos_mat, neg_mat], dim=1) \
-                                .reshape(-1, pos_mat.size(1))     # (2B, N)
-                pair_lab  = torch.tensor([1, 0], device=pos_mat.device) \
-                                .repeat(pos_mat.size(0))          # (2B,)
+                feature_rows.append(pair_features)
+                labels.append(pair_labels)
+                group_sizes.extend([2] * gathered_pairs.shape[0])
 
-                feat_rows.append(pair_feat)
-                labels.append(pair_lab)
-                group_sizes.extend([2] * pos_mat.size(0))           # B groups this batch
+        if not feature_rows:
+            raise RuntimeError(f"{description} produced no feature batches")
 
-            torch.cuda.empty_cache()
-
-        # gather all processes
-        X = accelerator.gather_for_metrics(torch.cat(feat_rows))      
-        y = accelerator.gather_for_metrics(torch.cat(labels))
-        g = accelerator.gather_for_metrics(torch.tensor(group_sizes, device=device))
-
-        return X.float().cpu().numpy(), y.cpu().numpy(), g.cpu().numpy()
-
-    if is_main: print("→ Building X_train ...")
-    X_train, y_train, g_train = gather_pairwise_features(dl_train)
-    dtrain = xgb.DMatrix(X_train, label=y_train)
-    dtrain.set_group(g_train)
-
-    X_val, y_val, g_val = gather_pairwise_features(dl_eval)
-    dval = xgb.DMatrix(X_val, label=y_val)
-    dval.set_group(g_val)
-
-
-    # -------------------------------------------------------------
-    # 3.7 Fit XGBoost booster (rank 0 only)
-    # -------------------------------------------------------------
-    if is_main:
-        params = dict(
-            objective="rank:pairwise",
-            # eval_metric="auc",
-            eval_metric="ndcg@2",
-            disable_default_eval_metric=1,
-            tree_method=args.tree_method,
-            max_depth=args.xgb_max_depth,
-            min_child_weight=30,   # force larger leaves
-            gamma=2.0,             # minimum loss drop to split
-            lambda_=2.0,           # L2 penalty
-            alpha=0.1,             # L1 penalty
-            # --- add randomness ---
-            subsample=0.8,         # bag rows
-            colsample_bytree=0.8,  # bag features per tree
-            colsample_bylevel=0.8,
-            # --- slower learning ---
-            eta=0.03,    
+        features = torch.cat(feature_rows)
+        gathered_labels = torch.cat(labels)
+        groups = torch.tensor(group_sizes, device=device, dtype=torch.int32)
+        return (
+            features.float().cpu().numpy(),
+            gathered_labels.cpu().numpy(),
+            groups.cpu().numpy(),
         )
-        print("→ Training XGBoost …")
-        pair_cb = PairAccCB(dval)
-        save_cb = SaveBestAccCB(pair_cb, args.booster_out, rank_zero=is_main)
+
+    train_features, train_labels, train_groups = gather_pairwise_features(
+        train_loader, "extract train"
+    )
+    valid_features, valid_labels, valid_groups = gather_pairwise_features(
+        eval_loader, "extract validation"
+    )
+
+    if is_main:
+        dtrain = xgb.DMatrix(train_features, label=train_labels)
+        dtrain.set_group(train_groups)
+        dvalid = xgb.DMatrix(valid_features, label=valid_labels)
+        dvalid.set_group(valid_groups)
+
+        params = {
+            "objective": "rank:pairwise",
+            "eval_metric": "ndcg@2",
+            "disable_default_eval_metric": 1,
+            "max_depth": args.xgb_max_depth,
+            "min_child_weight": args.xgb_min_child_weight,
+            "gamma": args.xgb_gamma,
+            "lambda": args.xgb_reg_lambda,
+            "alpha": 0.1,
+            "subsample": 0.8,
+            "colsample_bytree": 0.8,
+            "colsample_bylevel": 0.8,
+            "eta": args.xgb_eta,
+            **_xgboost_device_params(args.tree_method),
+        }
+        print("Training XGBoost")
+        pair_callback = PairAccCB(
+            dvalid,
+            checkpoint_path=args.booster_out,
+            early_stopping=args.early_stopping,
+        )
         booster = xgb.train(
             params,
             dtrain,
             num_boost_round=args.num_round,
-            evals=[(dval, "val")],
-            callbacks=[pair_cb, save_cb],          # <-- order matters
-            early_stopping_rounds=args.early_stopping,
-            verbose_eval=1,
+            evals=[(dvalid, "validation")],
+            callbacks=[pair_callback],
+            verbose_eval=True,
         )
-        # booster.save_model(args.booster_out)
-        # print(f"✓ Booster saved ➜ {args.booster_out}")
+        print(
+            f"Finished XGBoost: best_iteration={pair_callback.best_iteration}, "
+            f"best_pair_accuracy={pair_callback.best_acc:.4f}"
+        )
 
     accelerator.wait_for_everyone()
 
-# ──────────────────────────────────────────────────────────────────────────
+
 if __name__ == "__main__":
     main()
-

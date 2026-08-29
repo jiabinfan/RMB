@@ -8,6 +8,35 @@ from peft import PeftModel, PeftConfig
 from safetensors import safe_open
 
 
+def last_non_pad_indices(attention_mask, batch_size, sequence_length, device):
+    """Return the last attended position for left- or right-padded batches."""
+    if attention_mask is None:
+        return torch.full(
+            (batch_size,), sequence_length - 1, dtype=torch.long, device=device
+        )
+    if attention_mask.ndim != 2:
+        raise ValueError(
+            f"Expected a 2-D attention mask, got shape {tuple(attention_mask.shape)}"
+        )
+    if attention_mask.shape[0] != batch_size:
+        raise ValueError(
+            f"Attention-mask batch {attention_mask.shape[0]} does not match "
+            f"hidden-state batch {batch_size}"
+        )
+    if attention_mask.shape[1] != sequence_length:
+        raise ValueError(
+            f"Attention-mask length {attention_mask.shape[1]} does not match "
+            f"hidden-state length {sequence_length}"
+        )
+
+    mask = attention_mask.to(device=device, dtype=torch.bool)
+    positions = torch.arange(sequence_length, device=device).unsqueeze(0)
+    last_indices = positions.expand_as(mask).masked_fill(~mask, -1).amax(dim=-1)
+    if (last_indices < 0).any():
+        raise ValueError("Every reward-model input must contain at least one token")
+    return last_indices
+
+
 class ValueHead(nn.Module):
     r"""
     The ValueHead class implements a head for GPT2 that returns a scalar for each output token.
@@ -138,9 +167,17 @@ class AutoModelForCausalLMWithValueHead(PreTrainedModelWrapper):
         elif not hasattr(self.v_head.summary, 'weight') and (last_hidden_state.device != self.v_head.summary[0].weight.device):
             last_hidden_state = last_hidden_state.to(self.v_head.summary[0].weight.device)
         
-        # use the last token value as reward
-        last_index = attention_mask.sum(dim=-1) - 1
-        value = self.v_head(last_hidden_state).squeeze(-1)[torch.arange(len(last_hidden_state)), last_index]
+        # Use the last attended token as reward (supports left/right padding).
+        last_index = last_non_pad_indices(
+            attention_mask,
+            last_hidden_state.shape[0],
+            last_hidden_state.shape[1],
+            last_hidden_state.device,
+        )
+        value = self.v_head(last_hidden_state).squeeze(-1)[
+            torch.arange(len(last_hidden_state), device=last_hidden_state.device),
+            last_index,
+        ]
 
         # force upcast in fp32 if logits are in half-precision
         if lm_logits.dtype != torch.float32:
@@ -267,10 +304,18 @@ class AutoModelForCausalLMWithMultiValueHead(PreTrainedModelWrapper):
         )
         last_hidden = base_out.hidden_states[-1]
 
-        # index last non-pad token for every sample
-        last_idx = attention_mask.sum(dim=-1) - 1
+        # Index the last attended token for every sample. Unlike sum(mask)-1,
+        # this is correct for both left and right padding.
+        last_idx = last_non_pad_indices(
+            attention_mask,
+            last_hidden.shape[0],
+            last_hidden.shape[1],
+            last_hidden.device,
+        )
         v = self._select_vhead(active_head)(last_hidden)          # (B,L,1)
-        reward = v.squeeze(-1)[torch.arange(len(v)), last_idx]    # (B,)
+        reward = v.squeeze(-1)[
+            torch.arange(len(v), device=v.device), last_idx.to(v.device)
+        ]                                                         # (B,)
 
         return (base_out.logits, base_out.loss, reward)
 

@@ -1,11 +1,5 @@
-from accelerate import Accelerator
-import evaluate
 import numpy as np
-import os
 from collections import OrderedDict
-import torch
-import torch.nn as nn
-accuracy = evaluate.load('accuracy')
 
 
 def is_lora_model(model):
@@ -28,7 +22,7 @@ def compute_metrics(eval_pred):
     predictions = eval_pred.predictions
     predictions = np.argmax(predictions, axis=1)
     labels = np.zeros(predictions.shape)
-    return accuracy.compute(predictions=predictions, references=labels)
+    return {"accuracy": float((predictions == labels).mean())}
 
 
 def grm_compute_metrics(eval_pred):
@@ -63,5 +57,4 @@ def print_trainable_parameters(model, print_trainable_name=False):
 def freeze_trainable_parameters(model):
     for param in model.parameters():
         param.requires_grad = False
-
 

@@ -1,6 +1,17 @@
 from tqdm import tqdm
 import numpy as np
+import os
 from datasets import load_dataset, concatenate_datasets
+
+
+def _dataset_num_proc(dataset, cap=8):
+    """Bound Arrow workers by the CPUs allocated to the Slurm task."""
+    try:
+        allocated = int(os.environ.get("SLURM_CPUS_PER_TASK", "1"))
+    except ValueError:
+        allocated = 1
+    return max(1, min(cap, allocated, len(dataset)))
+
 
 def build_unified_eval_dataset(data_path, tokenizer, split='val', size=None):
     try:
@@ -8,10 +19,13 @@ def build_unified_eval_dataset(data_path, tokenizer, split='val', size=None):
     except:
         ds = load_dataset(data_path, split=split)
     # drop examples where A and B have same rating
-    ds = ds.filter(lambda ex: ex['conv_A_rating'] != ex['conv_B_rating'], num_proc=30)
+    ds = ds.filter(
+        lambda ex: ex['conv_A_rating'] != ex['conv_B_rating'],
+        num_proc=_dataset_num_proc(ds),
+    )
 
     if size is not None:
-        ds = ds.select(range(size))
+        ds = ds.select(range(min(size, len(ds))))
 
     source_dict = {
         'argilla/ultrafeedback-binarized-preferences-cleaned': 0,
@@ -79,7 +93,7 @@ def build_unified_eval_dataset(data_path, tokenizer, split='val', size=None):
     ds = ds.map(
         formatting_func,
         batched=False,
-        num_proc=10,
+        num_proc=_dataset_num_proc(ds),
         load_from_cache_file=False,  # ensure we rerun even if a cache exists
     )
 
@@ -97,7 +111,7 @@ def build_unified_eval_dataset(data_path, tokenizer, split='val', size=None):
     ds = ds.filter(
         lambda ex: len(ex['input_ids']) <= tokenizer.model_max_length
                    and len(ex['input_ids_rejected']) <= tokenizer.model_max_length,
-        num_proc=10,
+        num_proc=_dataset_num_proc(ds),
     )
 
     # finally, tell HF to convert lists → torch.Tensor at training time
@@ -123,7 +137,7 @@ def build_ood_eval_dataset(data_path, tokenizer, split='test', size=None):
         ds = load_dataset(data_path, split=split)
 
     if size is not None:
-        ds = ds.select(range(size))
+        ds = ds.select(range(min(size, len(ds))))
 
     def formatting_func(example):
         # same kwargs as above
@@ -294,7 +308,10 @@ def build_rewardbench_v1_dataset(tokenizer, category="overall", split="filtered"
         def _norm(x): return x.lower().replace("_", "-").strip()
         wanted_norm = {_norm(x) for x in wanted}
 
-        ds = ds.filter(lambda ex: (_norm(ex["subset"]) in wanted_norm), num_proc=10)
+        ds = ds.filter(
+            lambda ex: (_norm(ex["subset"]) in wanted_norm),
+            num_proc=_dataset_num_proc(ds),
+        )
 
     # Optional size cap
     if size is not None:
@@ -350,7 +367,7 @@ def build_rewardbench_v1_dataset(tokenizer, category="overall", split="filtered"
     ds = ds.map(
         formatting_func,
         batched=False,
-        num_proc=10,
+        num_proc=_dataset_num_proc(ds),
         load_from_cache_file=False,
     )
 
@@ -368,20 +385,15 @@ def build_rewardbench_v1_dataset(tokenizer, category="overall", split="filtered"
     ds = ds.filter(
         lambda ex: len(ex["input_ids"]) <= tokenizer.model_max_length
                    and len(ex["input_ids_rejected"]) <= tokenizer.model_max_length,
-        num_proc=10,
+        num_proc=_dataset_num_proc(ds),
     )
 
     ds.set_format(type="torch")
     return ds
 
 def load_eval_dataset(task, tokenizer, size=None):
-    print("11119999999999999999999999999999", task)
     tl = task.lower()
     if 'unified' in task.lower():
-        size = None
-        # return build_unified_eval_dataset(
-        #     'llm-blender/Unified-Feedback', tokenizer, split='val', size=size
-        # )
         return build_unified_eval_dataset(
             task, tokenizer, split='val', size=size
         )
@@ -398,11 +410,14 @@ def load_eval_dataset(task, tokenizer, size=None):
             'Skywork/Skywork-Reward-Preference-80K-v0.2', tokenizer, split='train', size=size)
         dataset_split = dataset.train_test_split(test_size=0.005)
         train_dataset, eval_dataset = dataset_split['train'], dataset_split['test']
-        print("9999999999999999999999999999")
-        print(len(eval_dataset))
         return eval_dataset
 
-    elif ("rewardbench" in tl) or ("rb-v1" in tl) or ("rb1" in tl) or ("rbv1" in tl) or ("rb" in tl):
+    elif (
+        ("rewardbench" in tl)
+        or ("rb-v1" in tl)
+        or ("rb1" in tl)
+        or ("rbv1" in tl)
+    ):
         # Accept suffixes like:
         #   "rewardbench:chat", "rewardbench chat-hard", "rb-v1-safety",
         #   "rb1_reasoning", "rewardbench overall", etc.
