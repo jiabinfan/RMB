@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1200" height="360" viewBox="0 0 1200 360" role="img" aria-labelledby="title desc">
   <title id="title">RMB training pipeline</title>
-  <desc id="desc">Preference pairs pass through three diverse LoRA reward models, then into a pairwise XGBoost aggregator.</desc>
+  <desc id="desc">Preference pairs pass through three complementary reward models, then into a pairwise XGBoost aggregator.</desc>
   <style>
     .bg { fill: #101418; }
     .panel { fill: #182026; stroke: #475569; stroke-width: 1.5; }
@@ -50,15 +50,15 @@
   <rect class="panel" x="355" y="72" width="330" height="216" rx="8"/>
   <g class="pulse-a">
     <rect x="388" y="82" width="148" height="46" rx="6" fill="#176f65"/>
-    <text class="label" x="410" y="111">LoRA RM 1</text>
+    <text class="label" x="402" y="111">RM branch 1</text>
   </g>
   <g class="pulse-b">
     <rect x="388" y="157" width="148" height="46" rx="6" fill="#c28725"/>
-    <text class="label" x="410" y="186">LoRA RM 2</text>
+    <text class="label" x="402" y="186">RM branch 2</text>
   </g>
   <g class="pulse-c">
     <rect x="388" y="232" width="148" height="46" rx="6" fill="#b84f3a"/>
-    <text class="label" x="410" y="261">LoRA RM 3</text>
+    <text class="label" x="402" y="261">RM branch 3</text>
   </g>
   <path class="wire" d="M536 105 H646 M536 180 H646 M536 255 H646"/>
   <text class="formula" x="557" y="98">m_1</text>

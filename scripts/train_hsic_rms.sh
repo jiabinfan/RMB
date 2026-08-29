@@ -1,21 +1,24 @@
 #!/bin/bash
 #SBATCH --job-name=rmb_stage1
-#SBATCH --account=aip-lilimou
-#SBATCH --gres=gpu:l40s:1
+#SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=64G
 #SBATCH --time=1-00:00:00
-#SBATCH --output=/scratch/%u/%x_%j.out
+#SBATCH --output=slurm-%x-%j.out
 
 set -euo pipefail
 
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 REPO_ROOT=$(cd "$SCRIPT_DIR/.." && pwd)
-VENV="${RMB_VENV:-$SCRATCH/venvs/rmb}"
-OUTPUT_ROOT="${RMB_OUTPUT_ROOT:-$SCRATCH/rmb/checkpoints}"
+WORK_ROOT="${RMB_WORK_ROOT:-${SCRATCH:-$REPO_ROOT/.artifacts}/rmb}"
+VENV="${RMB_VENV:-$WORK_ROOT/venv}"
+OUTPUT_ROOT="${RMB_OUTPUT_ROOT:-$WORK_ROOT/checkpoints}"
 
-module --force purge
-module load StdEnv/2023 python/3.11.5 arrow/18.1.0
+if [[ -n "${RMB_MODULES:-}" ]]; then
+  read -r -a modules <<< "$RMB_MODULES"
+  module --force purge
+  module load "${modules[@]}"
+fi
 
 if [[ ! -x "$VENV/bin/python" ]]; then
   echo "Missing RMB environment: $VENV" >&2
@@ -24,8 +27,8 @@ if [[ ! -x "$VENV/bin/python" ]]; then
 fi
 source "$VENV/bin/activate"
 
-export HF_HOME="${HF_HOME:-$SCRATCH/rmb/huggingface}"
-export XDG_CACHE_HOME="${XDG_CACHE_HOME:-$SCRATCH/rmb/cache}"
+export HF_HOME="${HF_HOME:-$WORK_ROOT/huggingface}"
+export XDG_CACHE_HOME="${XDG_CACHE_HOME:-$WORK_ROOT/cache}"
 export TOKENIZERS_PARALLELISM=false
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export OMP_NUM_THREADS="${SLURM_CPUS_PER_TASK:-8}"

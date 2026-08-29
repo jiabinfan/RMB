@@ -1,22 +1,25 @@
 #!/bin/bash
 #SBATCH --job-name=rmb_stage2
-#SBATCH --account=aip-lilimou
-#SBATCH --gres=gpu:l40s:1
+#SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=64G
 #SBATCH --time=12:00:00
-#SBATCH --output=/scratch/%u/%x_%j.out
+#SBATCH --output=slurm-%x-%j.out
 
 set -euo pipefail
 
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 REPO_ROOT=$(cd "$SCRIPT_DIR/.." && pwd)
-VENV="${RMB_VENV:-$SCRATCH/venvs/rmb}"
-RESULT_ROOT="${RMB_RESULT_ROOT:-$SCRATCH/rmb/results}"
+WORK_ROOT="${RMB_WORK_ROOT:-${SCRATCH:-$REPO_ROOT/.artifacts}/rmb}"
+VENV="${RMB_VENV:-$WORK_ROOT/venv}"
+RESULT_ROOT="${RMB_RESULT_ROOT:-$WORK_ROOT/results}"
 ADAPTER_CHECKPOINT="${ADAPTER_CHECKPOINT:-}"
 
-module --force purge
-module load StdEnv/2023 python/3.11.5 arrow/18.1.0
+if [[ -n "${RMB_MODULES:-}" ]]; then
+  read -r -a modules <<< "$RMB_MODULES"
+  module --force purge
+  module load "${modules[@]}"
+fi
 
 if [[ ! -x "$VENV/bin/python" ]]; then
   echo "Missing RMB environment: $VENV" >&2
@@ -29,8 +32,8 @@ if [[ -z "$ADAPTER_CHECKPOINT" ]]; then
 fi
 source "$VENV/bin/activate"
 
-export HF_HOME="${HF_HOME:-$SCRATCH/rmb/huggingface}"
-export XDG_CACHE_HOME="${XDG_CACHE_HOME:-$SCRATCH/rmb/cache}"
+export HF_HOME="${HF_HOME:-$WORK_ROOT/huggingface}"
+export XDG_CACHE_HOME="${XDG_CACHE_HOME:-$WORK_ROOT/cache}"
 export TOKENIZERS_PARALLELISM=false
 export OMP_NUM_THREADS="${SLURM_CPUS_PER_TASK:-8}"
 mkdir -p "$HF_HOME" "$XDG_CACHE_HOME" "$RESULT_ROOT"

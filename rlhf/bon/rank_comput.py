@@ -44,8 +44,8 @@ def parse_args():
     p = argparse.ArgumentParser(
         description="Compute in-group nDCG/PNR/Footrule metrics between original and perturbed proxy scores."
     )
-    p.add_argument("--original", required=False, help="Path to original proxy_score.csv (ground truth).")
-    p.add_argument("--test", required=False, help="Path to perturbed proxy_score.csv (test).")
+    p.add_argument("--original", required=True, help="Path to original proxy_score.csv (ground truth).")
+    p.add_argument("--test", required=True, help="Path to perturbed proxy_score.csv (test).")
     p.add_argument("--k", type=int, default=None, help="Cutoff K for nDCG@K. Default: full intersecting group.")
     p.add_argument("--scheme", choices=["exp", "linear"], default="exp",
                    help="nDCG gain scheme: 'exp' uses (2^rel - 1); 'linear' uses rel.")
@@ -201,18 +201,6 @@ def compute_group_footrule(
 
 def main():
     args = parse_args()
-
-    #args.original ="/mnt/nvme/jiabin/lora-boosting/lora-boosting/rlhf/bon/step3_obtain_proxy_score/gemma-2b-it/grm_0perturb/proxy_score.csv"
-    #args.test ="/mnt/nvme/jiabin/lora-boosting/lora-boosting/rlhf/bon/step3_obtain_proxy_score/gemma-2b-it/grm_10perturb/proxy_score.csv"
-
-    args.original ="/mnt/nvme/jiabin/lora-boosting/lora-boosting/rlhf/bon/step3_obtain_proxy_score/gemma-2b-it/avg_0perturb/proxy_score.csv"
-    args.test ="/mnt/nvme/jiabin/lora-boosting/lora-boosting/rlhf/bon/step3_obtain_proxy_score/gemma-2b-it/avg_10perturb/proxy_score.csv"
-
-    #args.original ="/mnt/nvme/jiabin/lora-boosting/lora-boosting/rlhf/bon/step3_obtain_proxy_score/gemma-2b-it/bt_0perturb/proxy_score.csv"
-    #args.test ="/mnt/nvme/jiabin/lora-boosting/lora-boosting/rlhf/bon/step3_obtain_proxy_score/gemma-2b-it/bt_8perturb/proxy_score.csv"
-    
-    #args.original ="/mnt/nvme/jiabin/lora-boosting/lora-boosting/rlhf/bon/step3_obtain_proxy_score/gemma-2b-it/xgb3lora_0perturb/proxy_score.csv"
-    #args.test ="/mnt/nvme/jiabin/lora-boosting/lora-boosting/rlhf/bon/step3_obtain_proxy_score/gemma-2b-it/xgb3lora_10perturb/proxy_score.csv"
 
     df_orig = pd.read_csv(args.original)
     df_test = pd.read_csv(args.test)

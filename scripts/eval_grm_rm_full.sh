@@ -1,10 +1,10 @@
 
-gpu='4'
-port=8992
+gpu="${GPU_ID:-0}"
+port="${MAIN_PROCESS_PORT:-29500}"
 max_length=1024
 per_device_eval_batch_size=1
-base_model="/home/ry21/Generalizable-Reward-Model/save_reward_models/gemma-2b-it_GRM_len3000_fulltrain_5e-06_datapreference_700K/logs/checkpoint-30"
-peft_name=''
+base_model="${BASE_MODEL:-google/gemma-2b-it}"
+peft_name="${PEFT_NAME:-}"
 layer_type='mlp' # linear
 num_layers=1
 log_dir='./eval_GRM'
@@ -18,6 +18,5 @@ do
                                               --task ${task} --layer_type ${layer_type} --num_layers ${num_layers} 
 
 done
-
 
 
